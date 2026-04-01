@@ -17,6 +17,140 @@ A Go tool that tails log files in real-time, builds a statistical baseline using
 
 ---
 
+## High-Level Architecture
+
+```
++-----------------------------------------------------------------------------+
+|                     REAL-TIME LOG ANOMALY DETECTOR                          |
++-----------------------------------------------------------------------------+
+|                                                                             |
+|  +------------------+    +------------------+    +----------------------+  |
+|  |   Log Sources    |    |   Config / CLI   |    |  Prometheus /metrics |  |
+|  |                  |    |                  |    |     (optional)       |  |
+|  |  - File (tail)   |    |  - YAML file     |    +----------+-----------+  |
+|  |  - stdin (pipe)  |    |  - CLI flags     |               | scrape       |
+|  |  - log rotation  |    |  - Env vars      |               |              |
+|  +--------+---------+    +--------+---------+               |              |
+|           |                       |                         |              |
+|           v                       v                         |              |
+|  +-------------------------------------------------------------------+     |
+|  |                        INGESTION LAYER                            |<----+
+|  |                                                                   |     |
+|  |   Tailer goroutine                                                |     |
+|  |   - Poll-based, 100ms interval, no CGO, cross-platform           |     |
+|  |   - Detects file rotation via inode comparison                   |     |
+|  |   - bufio.Scanner with custom split (handles lines > 64 KB)      |     |
+|  +------------------------------+------------------------------------+     |
+|                                 |                                          |
+|                    chan RawLine (buffered 1024)                            |
+|                                 |                                          |
+|                                 v                                          |
+|  +-------------------------------------------------------------------+     |
+|  |                         PARSING LAYER                             |     |
+|  |                                                                   |     |
+|  |   Parser Pool  (N goroutines, default = NumCPU)                  |     |
+|  |                                                                   |     |
+|  |   +----------+  +----------+  +----------+  +----------+         |     |
+|  |   |  nginx   |  |  apache  |  |   JSON   |  |  syslog  |         |     |
+|  |   |  parser  |  |  parser  |  |  parser  |  |  parser  |         |     |
+|  |   +----------+  +----------+  +----------+  +----------+         |     |
+|  |                                                                   |     |
+|  |   Auto-detect: Probe() returns confidence score [0,1] per parser |     |
+|  +------------------------------+------------------------------------+     |
+|                                 |                                          |
+|                  chan ParsedEvent (buffered 512)                           |
+|                                 |                                          |
+|                                 v                                          |
+|  +-------------------------------------------------------------------+     |
+|  |                      AGGREGATION LAYER                            |     |
+|  |                                                                   |     |
+|  |   Counter goroutine  (emits one EventCount per second)           |     |
+|  |   - Total events/sec                                             |     |
+|  |   - Breakdown: by HTTP status / source IP / URL path            |     |
+|  |   - Error rate (4xx + 5xx / total)                              |     |
+|  |   - p99 latency (reservoir sample, capped at 10 000 pts)        |     |
+|  +------------------------------+------------------------------------+     |
+|                                 |                                          |
+|                   chan EventCount (buffered 64)                            |
+|                                 |                                          |
+|                                 v                                          |
+|  +-------------------------------------------------------------------+     |
+|  |                        ANALYSIS LAYER                             |     |
+|  |                                                                   |     |
+|  |   Analyzer goroutine                                              |     |
+|  |                                                                   |     |
+|  |   +-----------------------------------------------------------+   |     |
+|  |   |           Sliding Window  (circular buffer)               |   |     |
+|  |   |   60 x 1s buckets  |  O(1) push  |  zero allocs at warm  |   |     |
+|  |   |   Baseline = rolling mean over window                     |   |     |
+|  |   |   Two modes: ratio (mean x N)  or  sigma (mean + k*std)   |   |     |
+|  |   +-----------------------------------------------------------+   |     |
+|  |                                                                   |     |
+|  |   Detection Rules:                                               |     |
+|  |   - rate_spike    : rate > mean x spike_multiplier              |     |
+|  |   - error_surge   : error_rate > threshold (default 5%)         |     |
+|  |   - latency_spike : p99 > baseline_p99 x latency_multiplier     |     |
+|  |   - host_flood    : single IP > host_flood_fraction of traffic  |     |
+|  |   - silence       : zero events for N consecutive seconds       |     |
+|  |                                                                   |     |
+|  |   Per-kind cooldown timer  (default 30s, independently tracked) |     |
+|  |   Min baseline guard: no alerts until N buckets collected       |     |
+|  +------------------------------+------------------------------------+     |
+|                                 |                                          |
+|                     chan Anomaly (buffered 32)                             |
+|                                 |                                          |
+|                                 v                                          |
+|  +-------------------------------------------------------------------+     |
+|  |                        ALERTING LAYER                             |     |
+|  |                                                                   |     |
+|  |   MultiAlerter  (fan-out to all enabled alerters concurrently)   |     |
+|  |                                                                   |     |
+|  |   +--------------+  +-------------------+  +-----------------+   |     |
+|  |   |   Console    |  |      Webhook      |  |      File       |   |     |
+|  |   |   Alerter    |  |      Alerter      |  |     Alerter     |   |     |
+|  |   |              |  |                   |  |                 |   |     |
+|  |   | Colored TTY  |  | HTTP POST JSON    |  | Append .jsonl   |   |     |
+|  |   | output with  |  | HMAC-SHA256 sign  |  | Size-based      |   |     |
+|  |   | severity     |  | Retry queue with  |  | rotation        |   |     |
+|  |   | labels       |  | exponential delay |  |                 |   |     |
+|  |   +--------------+  +-------------------+  +-----------------+   |     |
+|  +-------------------------------------------------------------------+     |
+|                                                                             |
+|  +-------------------------------------------------------------------+     |
+|  |                    LIFECYCLE / SIGNAL HANDLER                     |     |
+|  |                                                                   |     |
+|  |   SIGINT / SIGTERM --> context.Cancel()                          |     |
+|  |                                                                   |     |
+|  |   Ordered drain:  Tailer  ->  Parsers  ->  Counter               |     |
+|  |                   -> Analyzer  ->  Alerters                      |     |
+|  |                                                                   |     |
+|  |   Each stage closes its output channel only after draining input  |     |
+|  |   Guarantees: no log events silently dropped on shutdown         |     |
+|  +-------------------------------------------------------------------+     |
+|                                                                             |
++-----------------------------------------------------------------------------+
+```
+
+### Data Flow
+
+```
+RawLine --> ParsedEvent --> EventCount --> Anomaly --> Alert
+ (text)     (structured)   (aggregated)   (detected)  (delivered)
+```
+
+### Layer Responsibilities
+
+| Layer | Component | Responsibility |
+|-------|-----------|---------------|
+| Ingestion | Tailer | Poll file, detect rotation, emit raw lines |
+| Parsing | Parser Pool | Regex-based format detection, normalize to ParsedEvent |
+| Aggregation | Counter | 1-second buckets, compute error rate + p99 latency |
+| Analysis | Analyzer + Window | Maintain baseline, evaluate rules, suppress duplicates |
+| Alerting | MultiAlerter | Fan out to console / webhook / file; retry on failure |
+| Observability | Metrics | Prometheus counters and gauges for every stage |
+
+---
+
 ## Architecture
 
 ```
