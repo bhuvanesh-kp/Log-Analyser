@@ -469,6 +469,29 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/tailer` — File Tailing and Rotation
+
+**Proposal:** A poll-based file tailer with a `Run(ctx, out)` blocking method. Seeks to EOF on startup (`follow=true`), reads all available lines on each poll, detects rotation via `os.SameFile` + size shrink, and supports stdin as a special case.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| File watching | Poll-based (`time.Sleep(pollInterval)`) | No CGO, no OS-specific APIs; `inotify` is Linux-only, `ReadDirectoryChangesW` needs CGO — polling works identically on Windows, Linux, and macOS |
+| Rotation detection | `os.SameFile(oldStat, newStat)` | Uses volume serial number + file index on Windows — detects rename-based rotation without CGO; standard library only |
+| Truncation detection | `currentStat.Size() < lastOffset` | Handles `copytruncate` mode where logrotate truncates the file in-place rather than renaming |
+| Line reading | `bufio.Scanner` with custom split func | Default 64KB scanner limit is too small for some log lines; custom split also strips `\r` so CRLF Windows logs are handled transparently |
+| Seek on open | Seek to EOF when `follow=true`, beginning when `false` | `follow=true` mimics `tail -f` — avoids reprocessing MB of existing history on startup |
+| Rotation re-seek | Seek to beginning of new file | After rotation the new file starts fresh — seeking to end would skip lines written between rotation detection and reopen |
+| Stdin support | `path == ""` → `os.Stdin` | No rotation check, no seek, no polling — read until EOF or ctx cancel |
+| Line numbering | `lineNum int64` incremented per line, reset on rotation | Aids debugging; allows correlating alerts back to specific source lines |
+| `out` ownership | Caller owns, `Run` never closes | Consistent with counter and pipeline channel ownership pattern |
+| Poll interval on Windows | Default 100ms from config | Windows ticker resolution is ~15ms; 100ms poll is well above that — no jitter concern |
+
+**Rejected:** `fsnotify` library — adds a dependency, uses OS-specific backends internally, still requires polling fallback on network filesystems. Pure polling is simpler and sufficient for 100ms latency requirements.
+
+**Rejected:** `bufio.Reader.ReadString('\n')` — does not handle lines exceeding the internal buffer; Scanner with a custom split is more robust.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
