@@ -448,6 +448,27 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/counter` — Bucket Aggregation
+
+**Proposal:** A `Counter` struct with a `Run(ctx, in, out)` blocking method. A `time.Ticker` fires every `BucketDuration`; on each tick the current bucket is flushed as an `EventCount` and a fresh empty bucket starts.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Flush trigger | `time.Ticker` every `BucketDuration` | Decoupled from event rate; fires even during silence — emits a zero-total bucket which the analyzer needs for silence detection |
+| P99 within bucket | Collect all `Latency` values in a `[]time.Duration`, sort at flush | Exact result; a 1s bucket at 10k req/s = 10k values, sort ≈ 1ms — acceptable. Reservoir sampling saves memory but adds complexity for marginal gain |
+| Error classification | HTTP: 4xx+5xx; non-HTTP: `Level == "error"` or `"fatal"` | Uniform coverage across log formats without separate config per format |
+| Zero-event flush | Flush `Total=0` bucket on every tick regardless of event count | Silence detection in the analyzer requires zero-total buckets in the window — skipping empty ticks would mask silence |
+| Counter config | Takes only `BucketDuration` from the main `Config` | Minimal coupling; counter is unaware of window size, thresholds, or alerting config |
+| `Run` method signature | `Run(ctx, in <-chan ParsedEvent, out chan<- EventCount)` — blocking | Consistent with the pipeline goroutine pattern; caller controls scheduling; context cancellation triggers drain-then-close |
+| Shutdown behaviour | On `ctx.Done()`: drain remaining in-flight events, then flush the final partial bucket | Guarantees no events are silently dropped on SIGTERM; final partial bucket gives the analyzer the most recent data |
+| `time.Ticker` on Windows | No special handling — bucket duration is 1s, ticker resolution is ~15ms | 15ms jitter on a 1s boundary is negligible for anomaly detection; no OS-specific code needed |
+
+**Rejected:** Flushing only when `in` is empty — creates variable-length buckets that break the sliding window's time assumptions and make baseline calculations incorrect.
+
+**Rejected:** Computing error rate and p99 incrementally inside the event loop — avoids an extra allocation but makes the flush path stateful and harder to test in isolation.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
