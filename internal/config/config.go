@@ -78,22 +78,22 @@ type AlertersConfig struct {
 
 // Config holds the complete runtime configuration for log_analyser.
 type Config struct {
-	LogFile            string        `yaml:"log_file"`
-	Format             string        `yaml:"format"`
-	Follow             bool          `yaml:"follow"`
-	PollInterval       time.Duration `yaml:"poll_interval"`
-	WindowSize         time.Duration `yaml:"window_size"`
-	BucketDuration     time.Duration `yaml:"bucket_duration"`
-	SpikeMultiplier    float64       `yaml:"spike_threshold_multiplier"`
-	ErrorRateThreshold float64       `yaml:"error_rate_threshold"`
-	HostFloodFraction  float64       `yaml:"host_flood_fraction"`
-	LatencyMultiplier  float64       `yaml:"latency_multiplier"`
-	SilenceThreshold   int           `yaml:"silence_threshold_seconds"`
-	AlertCooldown      time.Duration `yaml:"alert_cooldown"`
-	MinBaselineSamples int           `yaml:"min_baseline_samples"`
-	DetectionMethod    string        `yaml:"detection_method"`
-	ParserWorkers      int           `yaml:"parser_workers"`
-	MetricsAddr        string        `yaml:"metrics_addr"`
+	LogFile            string         `yaml:"log_file"`
+	Format             string         `yaml:"format"`
+	Follow             bool           `yaml:"follow"`
+	PollInterval       time.Duration  `yaml:"poll_interval"`
+	WindowSize         time.Duration  `yaml:"window_size"`
+	BucketDuration     time.Duration  `yaml:"bucket_duration"`
+	SpikeMultiplier    float64        `yaml:"spike_threshold_multiplier"`
+	ErrorRateThreshold float64        `yaml:"error_rate_threshold"`
+	HostFloodFraction  float64        `yaml:"host_flood_fraction"`
+	LatencyMultiplier  float64        `yaml:"latency_multiplier"`
+	SilenceThreshold   int            `yaml:"silence_threshold_seconds"`
+	AlertCooldown      time.Duration  `yaml:"alert_cooldown"`
+	MinBaselineSamples int            `yaml:"min_baseline_samples"`
+	DetectionMethod    string         `yaml:"detection_method"`
+	ParserWorkers      int            `yaml:"parser_workers"`
+	MetricsAddr        string         `yaml:"metrics_addr"`
 	Alerters           AlertersConfig `yaml:"alerters"`
 }
 

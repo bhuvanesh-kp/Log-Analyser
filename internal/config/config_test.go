@@ -29,8 +29,8 @@ func stubConfigFile(t *testing.T, content string) string {
 
 func TestDefault(t *testing.T) {
 	tests := []struct {
-		desc   string
-		check  func(t *testing.T, cfg *config.Config)
+		desc  string
+		check func(t *testing.T, cfg *config.Config)
 	}{
 		{
 			desc: "should return 'auto' when format is not set",
@@ -328,14 +328,14 @@ func TestLoadFile_Security(t *testing.T) {
 		wantSecretErr bool
 	}{
 		{
-			desc: "should return SecretInFileError when webhook secret is hardcoded in file",
-			yaml: "alerters:\n  webhook:\n    enabled: true\n    url: \"http://example.com\"\n    secret: \"hardcoded-bad-secret\"",
+			desc:          "should return SecretInFileError when webhook secret is hardcoded in file",
+			yaml:          "alerters:\n  webhook:\n    enabled: true\n    url: \"http://example.com\"\n    secret: \"hardcoded-bad-secret\"",
 			wantErr:       true,
 			wantSecretErr: true,
 		},
 		{
-			desc: "should return no error when webhook secret is absent from file",
-			yaml: "alerters:\n  webhook:\n    enabled: true\n    url: \"http://example.com\"",
+			desc:          "should return no error when webhook secret is absent from file",
+			yaml:          "alerters:\n  webhook:\n    enabled: true\n    url: \"http://example.com\"",
 			wantErr:       false,
 			wantSecretErr: false,
 		},
