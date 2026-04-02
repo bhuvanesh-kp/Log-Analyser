@@ -375,6 +375,58 @@ log_analyser_pipeline_channel_depth     Channel fill depth, label: channel
 
 ---
 
+## Design Decisions
+
+Decisions, trade-offs, and rejected alternatives recorded as components are built.
+
+---
+
+### `pkg/ringbuf` — Generic Circular Buffer
+
+**Proposal:** A fixed-capacity, generic `RingBuf[T any]` that overwrites the oldest entry when full.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Generic type parameter | `RingBuf[T any]` | Reusable across `EventCount`, future types; minor added complexity vs a hand-typed struct |
+| Synchronization | None — caller owns the lock | Keeps the buffer reusable and free of hidden contention; `Window` wraps it with `sync.RWMutex` |
+| `Slice()` return | Always a full copy | Callers (stats functions) iterate without holding a lock; mutations to the slice never corrupt internal state |
+| `At(i)` out-of-bounds | **Panic** | Consistent with Go slice semantics; the analyzer always guards with `Len()` before calling `At()` — a checked no-op return `(T, bool)` would hide logic bugs |
+| Overwrite on full | Oldest entry silently overwritten | Matches sliding-window semantics: old data expires naturally; no blocking, no error return |
+
+**Rejected:** A typed `EventCountRingBuf` — works but would need to be duplicated for any future ring-buffer user.
+
+---
+
+### `internal/window` — Thread-Safe Sliding Window
+
+**Proposal:** A thin `sync.RWMutex` wrapper around `RingBuf[counter.EventCount]`.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Locking strategy | `RWMutex`: write lock on `Push`, read lock on `Snapshot` | Multiple readers (analyzer, metrics) can snapshot concurrently; only the counter goroutine writes |
+| `Snapshot()` return | Full copy of the slice | Decouples stats computation from the lock; stats functions are pure and can run without holding any mutex |
+| Package boundary | `window` is separate from `counter` | `counter` defines `EventCount`; `window` imports `counter` but not vice versa — avoids circular import |
+| Capacity unit | Number of buckets (not time) | Caller controls resolution; `60 buckets × 1 s/bucket = 60 s window` is explicit in config |
+
+---
+
+### `internal/window/stats` — Pure Statistical Functions
+
+**Proposal:** Free functions over `[]counter.EventCount` — no receivers, no state, no locks.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Computation timing | Eagerly recomputed from a fresh snapshot on every analyzer tick | Avoids staleness bugs; window size ≤ 3600 entries, recompute takes < 1 ms — not worth caching |
+| No cached stats | No rolling accumulators | Simplicity wins; incremental mean/variance (Welford) would save ~microseconds but adds mutable state and edge-case bugs on wrap |
+| `StdDev` variant | **Population** stddev (divide by N) | Window buckets represent the complete observed population, not a sample drawn from a larger one |
+| `P99Latency` algorithm | Sort-based, nearest-rank formula | Exact result; O(n log n) over ≤ 3600 elements is negligible; reservoir sampling or T-digest would add complexity for no measurable gain here |
+| `ErrorRate` aggregation | **Weighted** by `Total` across buckets | A bucket with 1000 requests should outweigh one with 10; simple average would skew results during traffic ramps |
+| Zero-total bucket handling | Excluded from weighted error-rate denominator | Prevents division-by-zero and avoids ghost 0% buckets diluting the rate during silence periods |
+
+**Rejected:** Pre-computing stats inside `Window.Push()` — creates coupling between the window and stats logic, and means stats are re-derived from partial data during warmup.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
