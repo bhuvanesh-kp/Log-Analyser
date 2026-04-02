@@ -381,6 +381,27 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/config` — Configuration Loading
+
+**Proposal:** Viper-backed loader with three entry points (`LoadFile`, `LoadEnv`, `Load`), typed secret rejection, and a separate `Validate()` step.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Config library | `github.com/spf13/viper` | Handles YAML parsing, env-var binding, and precedence merging out of the box; avoids hand-rolling flag→file→default resolution |
+| Three public loaders | `LoadFile` / `LoadEnv` / `Load` | Each load path is independently testable; CLI wires `Load`, tests can use `LoadEnv` without touching the filesystem |
+| Secret rejection | `checkForFileSecrets()` runs **before** `setupEnv()` in `Load` | Any non-empty `alerters.webhook.secret` value at that point must have come from the file — env vars haven't been bound yet; avoids false positives |
+| Typed error for secret-in-file | `*SecretInFileError` with `IsSecretInFileError()` helper | Callers can distinguish this specific error from generic I/O errors without string matching; wraps cleanly with `errors.As` |
+| Nested env-var binding | Explicit `v.BindEnv("alerters.webhook.secret", "LOG_ANALYSER_WEBHOOK_SECRET")` per nested key | Viper's `AutomaticEnv` resolves `LOG_ANALYSER_FORMAT` → `format` but cannot map `LOG_ANALYSER_WEBHOOK_SECRET` → `alerters.webhook.secret` without explicit binding |
+| `Default()` is viper-free | Returns a plain `*Config` literal with hardcoded values | Tests that only need a valid base config do not spin up a viper instance; no file I/O, no env reads |
+| `Validate()` is a separate method | Called explicitly after loading, not inside the loaders | Lets callers mutate the config between load and validate (e.g., CLI flag overrides); loaders stay pure data mappers |
+| Validation style | Early-return per rule, plain `fmt.Errorf` strings | One error at a time is enough for a CLI tool; accumulating all errors adds complexity with minimal UX gain |
+
+**Rejected:** Merging `Validate()` into the loaders — forces callers to suppress validation when they only need partial config (e.g., loading defaults for help text display).
+
+**Rejected:** `mapstructure` auto-decode from viper — `extract()` maps keys explicitly, which makes the key names visible in one place and avoids silent field-name mismatches when struct tags differ from viper keys.
+
+---
+
 ### `pkg/ringbuf` — Generic Circular Buffer
 
 **Proposal:** A fixed-capacity, generic `RingBuf[T any]` that overwrites the oldest entry when full.
