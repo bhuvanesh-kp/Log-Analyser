@@ -13,6 +13,7 @@ Each section covers: purpose, data structures, every function, and key implement
 4. [internal/window — Sliding Window](#internalwindow--sliding-window)
 5. [internal/window/stats — Statistical Functions](#internalwindowstats--statistical-functions)
 6. [internal/config — Configuration Loading](#internalconfig--configuration-loading)
+7. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
 
 ---
 
@@ -359,3 +360,103 @@ Validates all fields independently of how the config was loaded. Called explicit
 | File enabled | Path must not be empty |
 
 Returns the first error encountered (early-return style). Returns `nil` if all rules pass.
+
+---
+
+## internal/tailer — File Tailing and Rotation
+
+**Files:**
+- `internal/tailer/tailer.go` — core logic (all platforms)
+- `internal/tailer/open_windows.go` — Windows-specific file open with `FILE_SHARE_DELETE`
+- `internal/tailer/open_other.go` — non-Windows stub wrapping `os.Open`
+
+**Purpose:** Reads a log file (or stdin) in real-time and emits one `RawLine` per log line. Handles log rotation (rename-based and truncation-based), CRLF line endings, and lines larger than `bufio.Scanner`'s default 64KB limit. This is the pipeline entry point — every `ParsedEvent` originates from a `RawLine` emitted here.
+
+### Data Structure
+
+```
+RawLine
+  Content  string     — log line text with trailing '\r' stripped
+  Source   string     — absolute file path, or "stdin"
+  ReadAt   time.Time  — wall clock time the line was read from disk
+  LineNum  int64      — 1-based counter; resets to 1 on each file open or rotation
+```
+
+### Build-Tag Split: `open_windows.go` / `open_other.go`
+
+The `openFile(path string) (*os.File, error)` function is the only platform-specific code in the tailer.
+
+**`open_windows.go`** (`//go:build windows`):
+Uses `syscall.CreateFile` with sharing flags:
+```
+FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+```
+The critical flag is `FILE_SHARE_DELETE`. On Windows, `os.Open` does not set this flag, which means `os.Rename` on an open file returns "The process cannot access the file because it is being used by another process." Adding `FILE_SHARE_DELETE` allows logrotate-style rename rotation while the tailer holds the file open.
+
+**`open_other.go`** (`//go:build !windows`):
+Simply wraps `os.Open`. On Linux and macOS, file renaming is permitted regardless of open handles — no special flags needed.
+
+### Functions
+
+#### `New(path string, follow bool, pollInterval time.Duration) *Tailer`
+Returns a configured `Tailer`. No I/O happens here. `path == ""` means stdin. `follow=true` seeks to EOF on startup (mimics `tail -f`); `follow=false` reads from byte 0 and returns at EOF.
+
+#### `(*Tailer).Run(ctx context.Context, out chan<- RawLine)`
+The public entry point. Dispatches to `runStdin` or `runFile` based on whether `path` is empty. Blocks until `ctx` is cancelled. Never closes `out` — the caller (pipeline) owns the channel.
+
+#### `(*Tailer).runStdin(ctx, out)` (internal)
+Creates one `Scanner` over `os.Stdin` and reads until EOF or ctx cancellation. No seek, no rotation check, no poll loop — stdin is a one-shot stream. Emits each line with `Source = "stdin"`.
+
+#### `(*Tailer).runFile(ctx, out)` (internal)
+The main file-follow loop. On entry:
+1. Opens the file with `openFile(path)` (platform-specific, see above).
+2. Seeks to EOF if `follow=true`, otherwise stays at byte 0.
+3. Captures the initial `os.FileInfo` as the rotation baseline.
+
+Then runs the poll loop:
+
+```
+loop:
+  seek to current offset
+  create fresh Scanner
+  drain all available lines -> emit to out, advance offset
+  if follow=false: return
+
+  stat the path again
+  if path missing          -> sleep, retry
+  if !os.SameFile(old,new) -> rotation detected: reopen, reset offset+lineNum
+  if size < offset OR
+     (size == offset AND mtime changed) -> truncation: seek to 0, reset offset+lineNum
+  else                     -> no new data: sleep(pollInterval)
+```
+
+**Why a fresh Scanner each poll cycle:** `bufio.Scanner` permanently sets an internal `done` flag on first EOF and never calls `Read` again. Re-using one scanner across polls would permanently stop reading after the first quiet period. Creating a new scanner after `f.Seek(offset, 0)` is the correct approach — it costs one small allocation per poll tick.
+
+**Rotation detection (`os.SameFile`):**
+`os.SameFile(oldStat, newStat)` compares the underlying OS file identity. On Windows this uses `VolumeSerialNumber + FileIndex` from `GetFileInformationByHandle` (standard library, no CGO). If the path now points to a different file (renamed rotation), `SameFile` returns false. The tailer closes the old handle, reopens the path, resets `offset=0` and `lineNum=0`, and continues the loop without sleeping — to avoid missing lines written to the new file in the brief gap.
+
+**Truncation detection (`size < offset` OR mtime change):**
+Two conditions trigger a truncation reset:
+- `newStat.Size() < offset` — the file shrank (classic `copytruncate` style: file is cleared in-place after the logger is told to reopen).
+- `newStat.Size() == offset && newStat.ModTime().After(stat.ModTime())` — file was overwritten with content of identical length. Size alone cannot detect this; the mtime guard catches same-size in-place rewrites.
+
+On truncation: `f.Seek(0, 0)` resets the file pointer, `offset` and `lineNum` are zeroed, `stat` is updated to the new `FileInfo`.
+
+#### `(*Tailer).sleep(ctx context.Context) bool` (internal)
+Blocks for `pollInterval` using `time.After`. Returns `false` if `ctx` is cancelled during the wait, `true` otherwise. Used as the sole sleep point in `runFile` — ensures context cancellation is never delayed by more than one poll interval.
+
+#### `newScanner(f) *bufio.Scanner` (internal)
+Creates a `bufio.Scanner` with:
+- A **1 MB token buffer** (`scanner.Buffer(make([]byte, 1MB), 1MB)`) — overrides the 64KB default. Allows single log lines up to 1 MB without error.
+- The custom `splitLines` split function.
+
+#### `splitLines(data []byte, atEOF bool) (advance, token, err)` (internal)
+A `bufio.SplitFunc` that splits on `'\n'` and returns the token **without** the newline character. A trailing `'\r'` is intentionally left in the token — this keeps the split function simple and lets `stripCR` remove it. The `advance` value is always `i+1` (past the `'\n'`), which means the offset arithmetic in `runFile` (`offset += int64(len(scanner.Bytes())) + 1`) is correct for both LF and CRLF files:
+
+```
+LF file:   raw bytes = "line\n"      token = "line"   (4 bytes)  advance = 5 = len(token)+1 ✓
+CRLF file: raw bytes = "line\r\n"   token = "line\r"  (5 bytes)  advance = 6 = len(token)+1 ✓
+```
+
+#### `stripCR(s string) string` (internal)
+Removes a trailing `'\r'` from a line if present. Called on `scanner.Text()` before setting `RawLine.Content`. This normalises CRLF Windows log files so the parser layer always receives bare text without carriage returns.
