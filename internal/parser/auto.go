@@ -44,7 +44,7 @@ func (p *autoParser) Parse(raw tailer.RawLine) (ParsedEvent, bool) {
 
 	// slow path — probe all candidates
 	for _, candidate := range p.probes {
-		event, ok := candidate.Parse(raw)
+		_, ok := candidate.Parse(raw)
 		if ok {
 			p.mu.Lock()
 			if p.locked == nil { // double-checked: another goroutine may have locked first
