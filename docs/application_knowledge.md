@@ -15,6 +15,7 @@ Each section covers: purpose, data structures, every function, and key implement
 6. [internal/analyzer — Anomaly Detection](#internalanalyzer--anomaly-detection)
 7. [internal/config — Configuration Loading](#internalconfig--configuration-loading)
 8. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
+9. [internal/alerter — Alert Delivery](#internalalerter--alert-delivery)
 
 ---
 
@@ -459,19 +460,21 @@ SeverityWarning  = "warning"
 SeverityCritical = "critical"
 ```
 
-#### `Anomaly` (public — passed to alerters)
+#### `Anomaly` (public — passed to alerters, serialised to JSON)
+```go
+type Anomaly struct {
+    DetectedAt    time.Time     `json:"detected_at"`
+    Kind          AnomalyKind   `json:"kind"`
+    Severity      SeverityLevel `json:"severity"`
+    Message       string        `json:"message"`
+    CurrentValue  float64       `json:"current_value"`
+    BaselineValue float64       `json:"baseline_value"`
+    ThresholdUsed float64       `json:"threshold_used"`
+    SpikeRatio    float64       `json:"spike_ratio"`
+    OffendingHost string        `json:"offending_host,omitempty"`
+}
 ```
-Anomaly
-  DetectedAt    time.Time     — wall time the anomaly was detected
-  Kind          AnomalyKind   — which rule fired
-  Severity      SeverityLevel — warning | critical
-  Message       string        — human-readable description
-  CurrentValue  float64       — observed metric (rate, error fraction, latency ms, host fraction)
-  BaselineValue float64       — window mean used as the comparison baseline
-  ThresholdUsed float64       — the computed threshold that was crossed
-  SpikeRatio    float64       — CurrentValue / BaselineValue (0 if baseline is 0)
-  OffendingHost string        — populated only for host_flood; empty otherwise
-```
+`OffendingHost` uses `omitempty` — the field is absent from JSON output for all kinds except `host_flood`. `time.Time` marshals as RFC3339 string natively. `AnomalyKind` and `SeverityLevel` are `string` type aliases and marshal as plain strings.
 
 #### `Analyzer` (public)
 ```
@@ -814,3 +817,209 @@ CRLF file: raw bytes = "line\r\n"   token = "line\r"  (5 bytes)  advance = 6 = l
 
 #### `stripCR(s string) string` (internal)
 Removes a trailing `'\r'` from a line if present. Called on `scanner.Text()` before setting `RawLine.Content`. This normalises CRLF Windows log files so the parser layer always receives bare text without carriage returns.
+
+---
+
+## internal/alerter — Alert Delivery
+
+**Files:**
+- `internal/alerter/alerter.go` — `Alerter` interface
+- `internal/alerter/console.go` — colored terminal output
+- `internal/alerter/webhook.go` — HTTP POST with HMAC-SHA256 signing and retry
+- `internal/alerter/file.go` — append JSONL to file
+- `internal/alerter/multi.go` — concurrent fan-out to all alerters
+
+**Purpose:** Delivers `analyzer.Anomaly` values to one or more destinations. The interface is deliberately minimal — implementation complexity lives in the concrete types, not the contract. `MultiAlerter` is the only component the pipeline interacts with directly; the others are registered into it.
+
+---
+
+### Interface
+
+#### `Alerter` (public)
+```go
+type Alerter interface {
+    Name() string
+    Send(ctx context.Context, a analyzer.Anomaly) error
+}
+```
+
+`Name()` returns a short identifier used in logs and metrics (e.g. `"console"`, `"webhook"`, `"file"`, `"multi"`).
+
+`Send` delivers the anomaly to the destination. `ctx` cancellation must abort in-flight work (HTTP requests, retry sleeps). Returns `nil` on success, a non-nil error on permanent or exhausted-retry failure.
+
+**`io.Closer` is opt-in, not part of the interface.** Only `FileAlerter` holds a persistent resource (an `*os.File`). `ConsoleAlerter` and `WebhookAlerter` have no resources to release. The pipeline type-asserts each alerter to `io.Closer` at shutdown and calls `Close()` only if it is implemented. Forcing `Close()` into the interface would add meaningless boilerplate to implementations that have nothing to close.
+
+---
+
+### `ConsoleAlerter` — `console.go`
+
+#### `NewConsoleAlerter(w io.Writer, color bool) *ConsoleAlerter`
+Returns a `ConsoleAlerter` that writes to `w` with ANSI color codes enabled or disabled by `color`. Using an injected `io.Writer` (instead of writing directly to `os.Stderr`) makes the alerter testable with a `bytes.Buffer` without subprocess tricks.
+
+#### `NewConsoleAlerterAuto(w io.Writer) *ConsoleAlerter`
+Auto-detects color support:
+1. `NO_COLOR` env var set → `color=false` (respects the `NO_COLOR` convention)
+2. `w` is `*os.File` and `Stat().Mode() & os.ModeCharDevice != 0` → `color=true` (actual TTY)
+3. Otherwise → `color=false` (piped to file or another process)
+
+#### `(*ConsoleAlerter).Name() string`
+Returns `"console"`.
+
+#### `(*ConsoleAlerter).Send(_ context.Context, a analyzer.Anomaly) error`
+Formats and writes one line to `w`. The context parameter is accepted but not used — console writes are synchronous and instant; there is nothing to cancel.
+
+**Output format (no color):**
+```
+[WARNING]  15:04:05 rate_spike     3000 req/sec (30.0× baseline of 100 req/sec)
+[CRITICAL] 15:04:05 silence        no log events for 30 consecutive seconds
+```
+
+**With color:**
+- Warning → `\033[33m` (yellow) before the line, `\033[0m` (reset) after
+- Critical → `\033[31m` (red) before the line, `\033[0m` (reset) after
+
+Timestamp formatted as `HH:MM:SS` via `a.DetectedAt.Format("15:04:05")`.
+
+---
+
+### `WebhookAlerter` — `webhook.go`
+
+#### `WebhookOption` (functional option type)
+```go
+type WebhookOption func(*WebhookAlerter)
+```
+
+#### `WithRetryDelays(delays []time.Duration) WebhookOption`
+Overrides the inter-attempt backoff durations. `delays[i]` is the sleep before the `(i+1)`-th attempt. Setting all delays to 0 is the test pattern — retries happen immediately without `time.Sleep`.
+
+#### `NewWebhookAlerter(url, secret string, client *http.Client, maxRetries int, opts ...WebhookOption) (*WebhookAlerter, error)`
+Returns a `WebhookAlerter`. Validates that `url` is non-empty — returns an error immediately otherwise.
+
+- `client == nil` → a default `http.Client` with a 5-second timeout is created internally.
+- `maxRetries` is the **total** number of attempts (including the first).
+- Default `retryDelays = [1s, 2s, 4s]` (exponential backoff up to 3 retries).
+- `opts` are applied after defaults, allowing tests to inject zero-duration delays.
+
+#### `(*WebhookAlerter).Name() string`
+Returns `"webhook"`.
+
+#### `(*WebhookAlerter).Send(ctx context.Context, a analyzer.Anomaly) error`
+Marshals the payload, then retries up to `maxRetries` times:
+
+**Payload structure:**
+```go
+struct {
+    AlertID string `json:"alert_id"`
+    analyzer.Anomaly              // embedded — all Anomaly fields appear at the top level
+}
+```
+`alert_id` is a fresh `uuid.New().String()` per `Send` call. The UUID is identical across retries of the same `Send` invocation, enabling idempotent processing at the receiver.
+
+**Retry logic:**
+```
+attempt 0: send immediately
+attempt i (i > 0):
+    sleep retryDelays[min(i-1, len(retryDelays)-1)]
+    if ctx.Done() → return ctx.Err()
+    send
+    if err == nil → return nil
+    if ctx error → return immediately
+    if 4xx status → return immediately (no retry)
+    if 5xx or network error → continue loop
+if all attempts exhausted → return last error
+```
+
+Zero-delay sleeps still honour ctx cancellation via a non-blocking `select { case <-ctx.Done(): ... default: }`.
+
+#### `(*WebhookAlerter).do(ctx, alertID, body)` (internal)
+Single HTTP POST attempt:
+1. `http.NewRequestWithContext` — binds the context so the client aborts on cancellation.
+2. Sets `Content-Type: application/json` and `X-Alert-ID: <uuid>`.
+3. If `secret != ""` → computes `HMAC-SHA256(secret, body)` and sets `X-Signature-SHA256: sha256=<hex>`. The signature covers the raw JSON bytes — receivers can verify by hashing the raw request body.
+4. `client.Do(req)` — performs the HTTP call.
+5. `resp.Body.Close()` — always closed; body content is not read.
+6. Status `>= 400` → returns `*httpStatusError{code}`.
+
+#### `httpStatusError` (internal)
+```go
+type httpStatusError struct{ code int }
+func (e *httpStatusError) Error() string
+```
+Wraps a non-2xx/3xx status code. Used by the retry loop to distinguish 4xx (abort) from 5xx (retry) via `errors.As`.
+
+---
+
+### `FileAlerter` — `file.go`
+
+#### `NewFileAlerter(path string) (*FileAlerter, error)`
+Opens (or creates) the file at `path` with `O_APPEND | O_CREATE | O_WRONLY` flags and `0o644` permissions.
+
+- `O_APPEND` — all writes go to the end of the file; safe from multiple-writer corruption on POSIX.
+- `O_CREATE` — creates the file if it does not yet exist.
+- Returns an error if the **parent directory** does not exist — the file system error propagates directly.
+
+Creates a `json.Encoder` bound to the file handle. `SetEscapeHTML(false)` prevents `<`, `>`, `&` characters in log messages from being unicode-escaped (e.g. `\u003c`) in the output.
+
+#### `(*FileAlerter).Name() string`
+Returns `"file"`.
+
+#### `(*FileAlerter).Send(_ context.Context, a analyzer.Anomaly) error`
+Acquires `sync.Mutex`, calls `enc.Encode(a)`, releases the mutex. `json.Encoder.Encode` writes one JSON object followed by a newline (`\n`) — exactly the JSONL format (one JSON document per line).
+
+**Thread safety:** `MultiAlerter` launches each alerter's `Send` in its own goroutine. The mutex ensures concurrent calls cannot interleave partial JSON lines in the output file.
+
+The context parameter is accepted but not used — file writes are synchronous and instant.
+
+#### `(*FileAlerter).Close() error`
+Acquires the mutex, closes the `*os.File`, releases the mutex. Called by the pipeline during shutdown via `io.Closer` type assertion. After `Close()`, further `Send` calls will return a file-closed error.
+
+---
+
+### `MultiAlerter` — `multi.go`
+
+#### `NewMultiAlerter(alerters ...Alerter) *MultiAlerter`
+Returns a `MultiAlerter` holding a slice of all provided alerters. The variadic signature allows constructing with zero alerters (no-op fanout), one alerter (pass-through), or many.
+
+#### `(*MultiAlerter).Name() string`
+Returns `"multi"`.
+
+#### `(*MultiAlerter).Send(ctx context.Context, a analyzer.Anomaly) error`
+Concurrent fan-out:
+```
+if len(alerters) == 0 → return nil
+
+errs := make([]error, len(alerters))
+for each alerter[i]:
+    go func() { errs[i] = alerter[i].Send(ctx, a) }()
+wg.Wait()
+return errors.Join(errs...)
+```
+
+**One goroutine per alerter** — a slow webhook retry (up to 7 s with default backoff) does not delay the console or file alerters. All three complete independently.
+
+**Error aggregation:** `errors.Join(errs...)` returns `nil` if all elements are `nil`, otherwise returns a combined error containing all non-nil errors separated by newlines. This means:
+- One alerter failing does not mask another's success.
+- The caller (pipeline) sees a non-nil error if *any* alerter failed.
+- The combined error message contains all individual failure messages — useful for log output.
+
+**Context propagation:** The same `ctx` is passed to every alerter's `Send`. If the pipeline cancels the context during a SIGTERM drain, all in-flight webhook retries abort simultaneously.
+
+---
+
+### JSON output example (`FileAlerter` / `WebhookAlerter`)
+
+```json
+{
+  "detected_at": "2026-04-01T12:00:01Z",
+  "kind": "rate_spike",
+  "severity": "critical",
+  "message": "3000 req/sec (30.0× baseline of 100 req/sec)",
+  "current_value": 3000,
+  "baseline_value": 100,
+  "threshold_used": 300,
+  "spike_ratio": 30,
+  "alert_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+`offending_host` is absent when not a `host_flood` anomaly (`omitempty`). `alert_id` is present only in the webhook payload (embedded struct); the file alerter writes the `Anomaly` struct directly without a wrapper.
