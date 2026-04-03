@@ -35,15 +35,15 @@ const (
 
 // Anomaly is emitted by the Analyzer when a detection rule fires.
 type Anomaly struct {
-	DetectedAt    time.Time
-	Kind          AnomalyKind
-	Severity      SeverityLevel
-	Message       string
-	CurrentValue  float64 // observed metric value
-	BaselineValue float64 // window mean / baseline
-	ThresholdUsed float64 // configured threshold that was crossed
-	SpikeRatio    float64 // CurrentValue / BaselineValue (0 if baseline is 0)
-	OffendingHost string  // set only for host_flood
+	DetectedAt    time.Time     `json:"detected_at"`
+	Kind          AnomalyKind   `json:"kind"`
+	Severity      SeverityLevel `json:"severity"`
+	Message       string        `json:"message"`
+	CurrentValue  float64       `json:"current_value"`  // observed metric value
+	BaselineValue float64       `json:"baseline_value"` // window mean / baseline
+	ThresholdUsed float64       `json:"threshold_used"` // configured threshold that was crossed
+	SpikeRatio    float64       `json:"spike_ratio"`    // CurrentValue / BaselineValue (0 if baseline is 0)
+	OffendingHost string        `json:"offending_host,omitempty"` // set only for host_flood
 }
 
 // ---------------------------------------------------------------------------
