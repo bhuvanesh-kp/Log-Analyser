@@ -492,6 +492,29 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/parser` — Log Format Parsing
+
+**Proposal:** A `Parser` interface with a registry and auto-detect strategy. A goroutine pool (`Pool`) fans one input channel across N workers. Four concrete parsers (nginx, apache, JSON, syslog) plus an auto-detect wrapper that locks to the first matching format.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| `Parse` return signature | `(ParsedEvent, bool)` — no `error` | Unparseable lines are a normal condition (comments, blank lines, partial writes); returning an error on every miss would force callers to pattern-match errors rather than just checking the bool |
+| Drop vs forward unparseable | **Drop silently**, increment a metric counter | Forwarding a half-parsed event would corrupt counter aggregations (wrong error rate, zero latency skewing p99); the raw line is always logged at `--verbose` |
+| Auto-detect locking | Lock to first format that matches **any** line | Log files are homogeneous — line 1 format == all subsequent lines; locking eliminates per-line overhead of trying all parsers after warmup |
+| Auto-detect order | `nginx → syslog → json → apache` | More-specific formats win: a syslog message body may be valid JSON, so syslog must be tried before the generic JSON parser; apache is last because its regex is a strict subset of nginx |
+| Apache vs nginx regex | Apache shares the **nginx regex** with optional referer/user-agent groups absent | Avoids maintaining two nearly-identical regexes; the only difference is the trailing `"$referer" "$ua"` groups which are optional in the shared pattern |
+| JSON field aliases | Hardcoded alias list: `timestamp`/`time`/`ts`/`@timestamp`, `level`/`severity`/`lvl`, `latency_ms`/`duration_ms`/`elapsed_ms` | Covers the 95% case (Logrus, Zap, structlog, ECS) without a configurable field map; YAGNI — adding config later is straightforward |
+| Latency unit convention | JSON numeric latency fields assumed **milliseconds**; nginx `$request_time` is **seconds** (3 decimal places) | Milliseconds is the most common unit in structured logging libraries; nginx's floating-point seconds is documented and unambiguous |
+| Pool worker count | Default `runtime.NumCPU()`, configurable via `Config.Workers` | Regex matching is CPU-bound; parallelism helps on multi-core; single-CPU machines get 1 worker with no contention overhead |
+| Pool shutdown | Workers drain `in` until closed, `sync.WaitGroup` closes `out` after last worker exits | Consistent with counter and tailer ownership model; caller detects completion via closed `out` channel |
+| Registry | `map[string]func() Parser` populated in `init()` | Each call to `NewParser` gets a fresh instance — avoids shared mutable state between pool workers calling the same parser |
+
+**Rejected:** Per-line auto-detect (try all parsers on every line) — 4× regex overhead on every line indefinitely; unnecessary after the first match locks the format.
+
+**Rejected:** Configurable JSON field map — adds config complexity and a validation surface for a feature that hardcoded aliases cover adequately in v1.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
