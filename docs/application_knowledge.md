@@ -8,7 +8,7 @@ Each section covers: purpose, data structures, every function, and key implement
 ## Table of Contents
 
 1. [pkg/ringbuf — Generic Circular Buffer](#pkgringbuf--generic-circular-buffer)
-2. [internal/parser — ParsedEvent type](#internalparser--parsedevent-type)
+2. [internal/parser — Log Format Parsing](#internalparser--log-format-parsing)
 3. [internal/counter — Bucket Aggregation](#internalcounter--bucket-aggregation)
 4. [internal/window — Sliding Window](#internalwindow--sliding-window)
 5. [internal/window/stats — Statistical Functions](#internalwindowstats--statistical-functions)
@@ -69,14 +69,23 @@ Allocates a fresh `[]T` of length `count`, fills it by calling `At(i)` for each 
 
 ---
 
-## internal/parser — ParsedEvent type
+## internal/parser — Log Format Parsing
 
-**File:** `internal/parser/parser.go`
+**Files:**
+- `internal/parser/parser.go` — `ParsedEvent`, `Parser` interface, registry, `Pool`
+- `internal/parser/nginx.go` — nginx combined log parser
+- `internal/parser/apache.go` — Apache CLF parser
+- `internal/parser/json.go` — structured JSON log parser
+- `internal/parser/syslog.go` — RFC5424 syslog parser
+- `internal/parser/auto.go` — format auto-detection with locking
 
-**Purpose:** Defines the normalised event type that all log-format parsers must produce. Acts as the contract between the parser layer and the counter layer.
+**Purpose:** Converts raw log lines (`tailer.RawLine`) into normalised `ParsedEvent` values. A goroutine pool fans one input channel across N worker goroutines. Unparseable lines are silently dropped — forwarding a half-parsed event would corrupt counter aggregations.
 
-### Data Structure
+---
 
+### Data Structures
+
+#### `ParsedEvent` (public — shared with `internal/counter`)
 ```
 ParsedEvent
   Timestamp  time.Time      — when the log event occurred
@@ -94,7 +103,178 @@ ParsedEvent
 **Field conventions:**
 - `StatusCode == 0` signals a non-HTTP log line (syslog, JSON structured log). The counter uses this to switch between HTTP error classification (4xx/5xx) and level-based classification (`error`/`fatal`).
 - `Latency == 0` means latency was not present in the log line and is excluded from p99 calculations.
-- `Level` is lower-cased by convention so comparisons are simple string equality.
+- `Level` is always lower-cased before storage so comparisons are simple string equality.
+
+#### `Parser` interface (public)
+```go
+type Parser interface {
+    Name()  string
+    Parse(raw tailer.RawLine) (ParsedEvent, bool)
+}
+```
+`Parse` returns `(event, true)` on success. `(_, false)` means the line should be dropped — blank line, comment, or format mismatch. No error return: unparseable lines are a normal condition, not an exception.
+
+#### `Pool` (public)
+```
+Pool
+  format   string  — format name passed to NewParser for each worker
+  workers  int     — number of goroutines to spawn (minimum 1)
+```
+
+---
+
+### Functions — `parser.go`
+
+#### `NewParser(format string) (Parser, error)`
+Looks up `format` in the package-level registry map and calls the registered factory function to return a fresh `Parser` instance. Returns an error for unknown format names. Each call returns a **new** instance — workers in the pool never share a `Parser`.
+
+**Registry (populated at package init):**
+| Key        | Factory           |
+|------------|-------------------|
+| `"nginx"`  | `&nginxParser{}`  |
+| `"apache"` | `&apacheParser{}` |
+| `"json"`   | `&jsonParser{}`   |
+| `"syslog"` | `&syslogParser{}` |
+| `"auto"`   | `newAutoParser()` |
+
+#### `NewPool(format string, workers int) *Pool`
+Returns a `Pool`. If `workers < 1`, clamped to 1.
+
+#### `(*Pool).Run(ctx, in <-chan tailer.RawLine, out chan<- ParsedEvent)`
+Spawns `workers` goroutines. Each worker:
+1. Creates its own `Parser` via `NewParser(format)` — no shared mutable state between workers.
+2. Loops on a two-way select:
+   - `case raw, ok := <-in` — parses the line; sends to `out` if `ok==true`; returns if channel is closed.
+   - `case <-ctx.Done()` — returns immediately.
+3. `sync.WaitGroup` ensures `Run` blocks until **all** workers have exited.
+
+`Run` does **not** close `out` — the caller (pipeline) owns the output channel lifetime. The caller detects completion by waiting for `Run` to return.
+
+---
+
+### Functions — `nginx.go`
+
+#### `(*nginxParser).Name() string`
+Returns `"nginx"`.
+
+#### `(*nginxParser).Parse(raw tailer.RawLine) (ParsedEvent, bool)`
+Applies a single pre-compiled `regexp.MustCompile` against the trimmed line content.
+
+**Regex captures (in order):**
+1. `remote_addr` → `Host`
+2. `time_local` → `Timestamp` (parsed with layout `"02/Jan/2006:15:04:05 -0700"`)
+3. `method` → `Method`
+4. `path` → `Path`
+5. `status` → `StatusCode`
+6. `body_bytes_sent` → `Bytes` (`"-"` is treated as 0, for 304 responses)
+7. `request_time` (optional, last group) → `Latency` — float seconds converted via `time.Duration(secs * float64(time.Second))`
+
+The trailing `request_time` group is optional (`(?:\s+([\d.]+))?$`) — absent when nginx is configured without `$request_time` in the log format. `Latency` is left as zero in that case.
+
+Returns `(_, false)` for empty lines or lines that do not match the regex.
+
+---
+
+### Functions — `apache.go`
+
+#### `(*apacheParser).Name() string`
+Returns `"apache"`.
+
+#### `(*apacheParser).Parse(raw tailer.RawLine) (ParsedEvent, bool)`
+Applies a stricter regex than nginx — the Apache CLF regex has **no** trailing referer, user-agent, or request-time groups. This ensures apache lines do not accidentally match the nginx pattern and vice versa.
+
+Captures: `host`, `time` (same layout as nginx), `method`, `path`, `status`, `bytes`.
+
+`Latency` is always zero — CLF has no latency field. `Level` is always empty.
+
+Reuses `nginxTimeLayout` constant from `nginx.go` — both formats share the same `dd/Mon/yyyy:HH:MM:SS tz` timestamp format.
+
+---
+
+### Functions — `json.go`
+
+#### `(*jsonParser).Name() string`
+Returns `"json"`.
+
+#### `(*jsonParser).Parse(raw tailer.RawLine) (ParsedEvent, bool)`
+Fast-fail: returns `(_, false)` immediately if the trimmed line is empty or does not start with `{`.
+
+Otherwise calls `json.Unmarshal` into a `map[string]any`. If unmarshal fails, returns `(_, false)`.
+
+**Field resolution uses alias lists (first match wins):**
+
+| `ParsedEvent` field | Aliases tried in order                    |
+|---------------------|-------------------------------------------|
+| `Timestamp`         | `timestamp`, `time`, `ts`, `@timestamp`   |
+| `Level`             | `level`, `severity`, `lvl`                |
+| `Latency`           | `latency_ms`, `duration_ms`, `elapsed_ms` |
+
+Timestamp parsing:
+- String values → `time.Parse(time.RFC3339, val)`
+- Float64 values → interpreted as Unix epoch seconds (Zap's `ts` field convention)
+
+Level is lowercased via `strings.ToLower`.
+
+Latency numeric values are assumed **milliseconds** — the most common unit in structured logging libraries (Logrus, Zap, structlog, ECS).
+
+Optional HTTP fields read directly by key: `host`, `method`, `path`, `status_code`.
+
+---
+
+### Functions — `syslog.go`
+
+#### `(*syslogParser).Name() string`
+Returns `"syslog"`.
+
+#### `(*syslogParser).Parse(raw tailer.RawLine) (ParsedEvent, bool)`
+Fast-fail: returns `(_, false)` if the line is empty or does not start with `<`.
+
+Applies a regex matching the RFC5424 header:
+```
+<PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA
+```
+Captures: `PRI` (integer), `TIMESTAMP` (RFC3339), `HOSTNAME`.
+
+**PRI → Level mapping** via `priToLevel(pri int)`:
+```
+severity = pri % 8     (RFC5424: PRI = facility*8 + severity)
+0,1,2 (emerg/alert/crit) → "fatal"
+3 (error)                → "error"
+4 (warning)              → "warn"
+5,6 (notice/info)        → "info"
+7 (debug)                → "debug"
+```
+
+`StatusCode`, `Latency`, `Method`, `Path`, `Bytes` are always zero/empty — syslog is a non-HTTP format.
+
+---
+
+### Functions — `auto.go`
+
+#### `newAutoParser() *autoParser`
+Returns an `autoParser` with a `probes` list in detection-priority order:
+```
+nginx → syslog → json → apache
+```
+**Order rationale:**
+- `nginx` before `apache`: the apache regex is a strict subset of the nginx regex (fewer trailing groups); trying nginx first correctly classifies combined-format lines.
+- `syslog` before `json`: a syslog message body may itself be valid JSON; the more specific format must win.
+- `apache` last: least likely in practice and most likely to be a subset match.
+
+#### `(*autoParser).Name() string`
+Returns `"auto"`.
+
+#### `(*autoParser).Parse(raw tailer.RawLine) (ParsedEvent, bool)`
+**Fast path (locked):** If `p.locked` is non-nil (format already detected), delegates directly to `p.locked.Parse(raw)`. No mutex contention after warm-up — read under lock, then call outside lock.
+
+**Slow path (probe):** Tries each candidate in `probes` order. On first success:
+1. Acquires the mutex.
+2. Double-checked lock: sets `p.locked = candidate` only if `p.locked == nil` (prevents two workers racing to lock to different formats).
+3. Re-calls `p.locked.Parse(raw)` — ensures the locked winner is used even if another goroutine raced and locked first.
+
+Returns `(_, false)` if no candidate matches.
+
+**Concurrency safety:** `p.locked` is read and written under `sync.Mutex`. The double-checked pattern ensures exactly one format wins the race across all pool workers without requiring a full lock on every call after warm-up.
 
 ---
 
@@ -171,11 +351,11 @@ Returns 0 for an empty slice.
 #### `(*Counter).Run(ctx, in <-chan ParsedEvent, out chan<- EventCount)`
 The main blocking loop. Starts a `time.Ticker` for `bucketDuration`. Runs a three-way `select`:
 
-| Branch | Action |
-|--------|--------|
-| `case e, ok := <-in` | If `ok`, calls `cur.add(e)`. If channel is closed (`!ok`), sets `in = nil` to prevent the select from spinning on zero-value reads from a closed channel. |
+| Branch                 | Action |
+|------------------------|--------|
+| `case e, ok := <-in`   | If `ok`, calls `cur.add(e)`. If channel is closed (`!ok`), sets `in = nil` to prevent the select from spinning on zero-value reads from a closed channel. |
 | `case t := <-ticker.C` | Calls `cur.flush(t)`, sends result to `out`, starts a fresh `newBucket(t)`. Fires even if no events arrived — emits a zero-total bucket which the analyzer needs for silence detection. |
-| `case <-ctx.Done()` | Performs a non-blocking drain of any events still buffered in `in`, then calls `cur.flush(time.Now())` and sends the final partial bucket to `out` before returning. Guarantees no events are lost on SIGTERM. |
+| `case <-ctx.Done()`    | Performs a non-blocking drain of any events still buffered in `in`, then calls `cur.flush(time.Now())` and sends the final partial bucket to `out` before returning. Guarantees no events are lost on SIGTERM. |
 
 **Ownership note:** `Run` never closes `out` — the caller (pipeline) owns the output channel lifetime.
 
@@ -345,19 +525,19 @@ Merges file and environment variables with correct precedence (env > file > defa
 #### `(*Config).Validate() error`
 Validates all fields independently of how the config was loaded. Called explicitly after loading — not inside the loaders — so callers can apply flag overrides between load and validate. Rules checked:
 
-| Rule | Condition |
-|------|-----------|
-| Format | Must be one of: `auto`, `nginx`, `apache`, `json`, `syslog` |
-| DetectionMethod | Must be `ratio` or `sigma` |
-| WindowSize | Must be >= BucketDuration |
-| SpikeMultiplier | Must be > 0 |
-| ErrorRateThreshold | Must be in (0, 1] |
-| HostFloodFraction | Must be in (0, 1] |
-| LatencyMultiplier | Must be > 0 |
-| MinBaselineSamples | Must be > 0 |
-| AlertCooldown | Must be >= 0 |
-| Webhook enabled | URL must not be empty |
-| File enabled | Path must not be empty |
+| Rule               | Condition                                                   |
+|--------------------|-------------------------------------------------------------|
+| Format             | Must be one of: `auto`, `nginx`, `apache`, `json`, `syslog` |
+| DetectionMethod    | Must be `ratio` or `sigma`                                  |
+| WindowSize         | Must be >= BucketDuration                                   |
+| SpikeMultiplier    | Must be > 0                                                 |
+| ErrorRateThreshold | Must be in (0, 1]                                           |
+| HostFloodFraction  | Must be in (0, 1]                                           |
+| LatencyMultiplier  | Must be > 0                                                 |
+| MinBaselineSamples | Must be > 0                                                 |
+| AlertCooldown      | Must be >= 0                                                |
+| Webhook enabled    | URL must not be empty                                       |
+| File enabled       | Path must not be empty                                      |
 
 Returns the first error encountered (early-return style). Returns `nil` if all rules pass.
 
