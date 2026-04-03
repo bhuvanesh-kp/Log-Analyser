@@ -571,6 +571,39 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/pipeline` — Goroutine Wiring and Lifecycle
+
+**Proposal:** A `Pipeline` struct that owns all inter-stage channels, constructs every component from `config.Config`, and exposes a single `Run(ctx) error` method. Ordered shutdown is implemented via wrapper goroutines that close each output channel after the upstream stage exits, propagating a drain wave downstream.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Channel ownership | Pipeline creates and closes all channels | No stage creates or closes a channel; eliminates double-close races and makes channel lifetimes visible in one place |
+| Constructor vs Run split | `New(cfg, alerter)` is pure setup; `Run(ctx)` starts goroutines | `New` is safe to call in tests without starting goroutines; `Run` is the only place goroutines are spawned — easy to reason about lifetime |
+| Ordered shutdown | Wrapper goroutines call `defer close(outputChan)` after each stage's `Run` returns | Each stage's `Run` already drains its input before returning; wrapping with `defer close` chains the drain signal downstream without modifying any stage's code |
+| Stage channel close responsibility | Pipeline wrapper goroutines, not the stages themselves | Existing stages (`counter`, `analyzer`) have "caller owns the channel" semantics; changing them would break their standalone tests; wrapper pattern is additive with no changes to existing code |
+| Alert loop | `for a := range anomC` in its own goroutine | `range` blocks until the channel is closed — guarantees every anomaly queued before shutdown is delivered before `Run` returns |
+| `io.Closer` for FileAlerter | Type-assert alerter to `io.Closer` after alert loop exits; call `Close()` if implemented | Keeps `io.Closer` out of the `Alerter` interface while still releasing file handles cleanly at shutdown |
+| Error handling in `Run` | Hard errors (e.g. tailer cannot open file) returned from `Run`; soft errors (alert delivery failures) logged via `slog` | A tailer open failure is unrecoverable — the pipeline cannot produce any output; alert delivery failures are transient and already retried by `WebhookAlerter` |
+| Signal handling | Not in pipeline — `main.go` owns `signal.NotifyContext` | Pipeline only reacts to ctx cancellation; decoupled from OS signal mechanics; easier to test (just cancel a context) |
+| Channel buffer sizes | `rawLines=1024`, `parsed=512`, `counts=64`, `anomalies=32` | Sized for realistic throughput ratios: parser pool is N× faster than counter (aggregation); counter emits 1 bucket/s so a small buffer is sufficient; anomalies are rare so 32 is ample |
+| Parser pool context | `pool.Run` receives `ctx` but drains until `rawLines` closes | Ensures lines buffered before ctx cancel are not dropped; the tailer stops producing, the pool drains what remains |
+
+**Shutdown cascade (no events dropped):**
+```
+ctx.Cancel()
+  → tailer.Run returns       → close(rawLines)
+  → pool drains rawLines     → close(parsed)
+  → counter drains parsed, flushes final bucket → close(counts)
+  → analyzer drains counts   → close(anomalies)
+  → alertLoop drains anomalies, delivers all pending alerts → done
+```
+
+**Rejected:** Having each stage close its own output channel — would require changing the existing stage contracts, breaking their standalone tests, and creating ambiguity about who owns the channel in non-pipeline contexts (e.g. unit tests that wire channels manually).
+
+**Rejected:** A single `sync.WaitGroup` over all goroutines with a shared context for shutdown — does not enforce ordering; the analyzer could exit before the counter flushes its final bucket, losing the last EventCount.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
