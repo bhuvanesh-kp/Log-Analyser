@@ -543,6 +543,34 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/alerter` — Alert Delivery
+
+**Proposal:** An `Alerter` interface with four implementations (console, webhook, file, multi-fanout). `MultiAlerter` fans out to all enabled alerters concurrently via goroutines. Cleanup is opt-in via `io.Closer` type assertion rather than mandated by the interface.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Interface signature | `Send(ctx context.Context, a analyzer.Anomaly) error` | Returns error so `MultiAlerter` and pipeline can log failures; context propagates cancellation into retry loops and HTTP calls |
+| `Close()` in interface | **No** — opt-in via `io.Closer` type assertion | Only `FileAlerter` holds a resource (`*os.File`); forcing `Close()` on `ConsoleAlerter` and `WebhookAlerter` is meaningless boilerplate; pipeline type-asserts to `io.Closer` and calls `Close()` only if the alerter implements it |
+| JSON serialization | Add json struct tags directly to `analyzer.Anomaly` | No wrapper struct needed; `time.Time` marshals as RFC3339 natively; `AnomalyKind` and `SeverityLevel` are string types and marshal naturally; both webhook and file share the same representation |
+| ConsoleAlerter output target | Injected `io.Writer` (defaults to `os.Stderr`) | Testable without capturing stdout/stderr; can be redirected by the caller without subprocess tricks |
+| ConsoleAlerter color detection | Check `NO_COLOR` env var first; then check if writer is `*os.File` with `ModeCharDevice` bit via `Stat()` | Respects the `NO_COLOR` convention; auto-disables ANSI codes when piped to a file or another process; no extra dependency |
+| ConsoleAlerter ANSI scheme | Warning = yellow (`\033[33m`), Critical = red (`\033[31m`), reset after each line | Two severity levels map cleanly to two universally supported ANSI colors |
+| WebhookAlerter signing | `X-Signature-SHA256: sha256=<hex>` (HMAC-SHA256 of body) | GitHub-compatible convention; widely understood by webhook receivers; optional — skipped when no secret is configured |
+| WebhookAlerter deduplication | `X-Alert-ID` request header + `"alert_id"` field in JSON body (UUID) | Allows idempotent retry handling at the receiver without tracking request state on the sender side |
+| WebhookAlerter retry policy | 3 attempts, fixed backoff 1 s / 2 s / 4 s; abort on 4xx or `ctx.Done()` | Transient 5xx and network errors are retried; 4xx indicates a config problem (wrong URL/secret) — retrying wastes time and fills receiver logs |
+| WebhookAlerter `http.Client` | Constructor-injected | Tests swap in a `httptest.Server`-backed client without starting a real server; no monkey-patching of global state |
+| FileAlerter open mode | `O_APPEND \| O_CREATE \| O_WRONLY` | Append mode is atomic on POSIX; file is created if absent; no read permission needed; one JSON object per line (JSONL) |
+| FileAlerter thread safety | `sync.Mutex` around `json.Encoder.Encode` + flush | Multiple goroutines in `MultiAlerter` could call `Send` concurrently; mutex ensures no interleaved JSON lines |
+| MultiAlerter concurrency | One goroutine per alerter, `sync.WaitGroup` to collect results | Webhook retry can take up to ~7 s; running alerters sequentially would block console and file output for the duration; goroutine-per-alerter lets fast alerters complete immediately |
+| MultiAlerter error handling | Collect all errors, log via `slog`, return `errors.Join(errs...)` | Errors from one alerter (e.g. webhook timeout) must not suppress delivery to others; caller sees a joined error if any alerter failed |
+| Cooldown / deduplication | **Not in alerter** — handled by `analyzer.emit()` | Centralising cooldown in the analyzer means all three alerters see the same filtered stream; no risk of per-alerter dedup diverging |
+
+**Rejected:** Sequential fan-out in `MultiAlerter` — a slow webhook retry would delay console and file alerts by up to 7 s, making the console output misleading during incidents.
+
+**Rejected:** A persistent retry queue (channel + background goroutine) for webhook — adds significant complexity (drain on shutdown, bounded queue size, backpressure) for a failure mode that is better addressed by lowering `max_retries` or using a more reliable transport at the infrastructure level.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
