@@ -12,8 +12,9 @@ Each section covers: purpose, data structures, every function, and key implement
 3. [internal/counter — Bucket Aggregation](#internalcounter--bucket-aggregation)
 4. [internal/window — Sliding Window](#internalwindow--sliding-window)
 5. [internal/window/stats — Statistical Functions](#internalwindowstats--statistical-functions)
-6. [internal/config — Configuration Loading](#internalconfig--configuration-loading)
-7. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
+6. [internal/analyzer — Anomaly Detection](#internalanalyzer--anomaly-detection)
+7. [internal/config — Configuration Loading](#internalconfig--configuration-loading)
+8. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
 
 ---
 
@@ -430,6 +431,179 @@ rank = ceil(0.99 × n)
 return sorted[rank-1]
 ```
 Takes the p99 of p99s — each bucket already represents the 99th percentile of raw latencies within its 1-second window. Returns 0 for an empty slice. Used in the `latency_spike` detection rule.
+
+---
+
+## internal/analyzer — Anomaly Detection
+
+**File:** `internal/analyzer/analyzer.go`
+
+**Purpose:** Receives `counter.EventCount` buckets from the counter, pushes them into the sliding window, evaluates five detection rules against the historical baseline, enforces per-kind cooldown, and emits `Anomaly` values. This is the intelligence layer — everything upstream produces data; the analyzer decides what is anomalous.
+
+---
+
+### Data Structures
+
+#### `AnomalyKind` (public)
+```
+KindRateSpike    = "rate_spike"
+KindErrorSurge   = "error_surge"
+KindLatencySpike = "latency_spike"
+KindHostFlood    = "host_flood"
+KindSilence      = "silence"
+```
+
+#### `SeverityLevel` (public)
+```
+SeverityWarning  = "warning"
+SeverityCritical = "critical"
+```
+
+#### `Anomaly` (public — passed to alerters)
+```
+Anomaly
+  DetectedAt    time.Time     — wall time the anomaly was detected
+  Kind          AnomalyKind   — which rule fired
+  Severity      SeverityLevel — warning | critical
+  Message       string        — human-readable description
+  CurrentValue  float64       — observed metric (rate, error fraction, latency ms, host fraction)
+  BaselineValue float64       — window mean used as the comparison baseline
+  ThresholdUsed float64       — the computed threshold that was crossed
+  SpikeRatio    float64       — CurrentValue / BaselineValue (0 if baseline is 0)
+  OffendingHost string        — populated only for host_flood; empty otherwise
+```
+
+#### `Analyzer` (public)
+```
+Analyzer
+  cfg      config.Config              — detection thresholds and settings
+  window   *window.Window             — sliding window of EventCount buckets
+  cooldown map[AnomalyKind]time.Time  — last-fired timestamp per kind
+```
+
+---
+
+### Functions
+
+#### `New(cfg config.Config, win *window.Window) *Analyzer`
+Returns a configured `Analyzer`. Initialises the `cooldown` map (empty). No goroutines started here — `Run` contains the blocking loop.
+
+**Why value-type `config.Config` (not pointer):** The analyzer captures the config at construction time; the caller may change the original struct without affecting detection thresholds mid-run.
+
+#### `(*Analyzer).Run(ctx, in <-chan counter.EventCount, out chan<- Anomaly)`
+The main blocking loop. Two-way select:
+
+| Branch | Action |
+|--------|--------|
+| `case <-ctx.Done()` | Return immediately |
+| `case ec, ok := <-in` | If closed (`!ok`), return. Otherwise: call `evaluate(ec, out)` **first**, then `window.Push(ec)` |
+
+**Critical ordering — evaluate before push:** The current bucket is evaluated against the historical window *before* being added to it. If the spike bucket were pushed first, it would inflate the window mean and reduce its own spike ratio, potentially suppressing the alert. The historical baseline must be uncontaminated by the bucket being judged.
+
+`Run` does **not** close `out` — the caller (pipeline) owns the output channel.
+
+#### `(*Analyzer).evaluate(current counter.EventCount, out chan<- Anomaly)` (internal)
+Takes a window snapshot and checks the baseline guard first:
+
+```
+snap = window.Snapshot()
+if len(snap) < MinBaselineSamples → return  (window not warm yet)
+```
+
+Computes the rate threshold based on `DetectionMethod`:
+- **ratio:** `threshold = mean × SpikeMultiplier`
+- **sigma:** `threshold = mean + SpikeMultiplier × stddev`
+
+Then calls all five check functions in sequence. Each check is independent — multiple rules can fire on the same bucket.
+
+---
+
+### Detection Rules
+
+#### `checkRate` — `rate_spike`
+```
+cur = float64(current.Total)
+if cur > threshold → emit rate_spike
+```
+`SpikeRatio = cur / mean` (0 if mean is 0).
+
+**Severity:** Warning if `SpikeRatio < 10`, Critical if `≥ 10`.
+
+#### `checkError` — `error_surge`
+```
+if current.ErrorRate > ErrorRateThreshold → emit error_surge
+```
+Strict greater-than — equal to threshold does not fire. `CurrentValue = current.ErrorRate`.
+
+**Severity:** always Warning.
+
+#### `checkLatency` — `latency_spike`
+```
+baselineP99 = window.P99Latency(snap)
+threshold   = baselineP99 × LatencyMultiplier
+if current.P99Latency > threshold → emit latency_spike
+```
+Two early exits: if `current.P99Latency == 0` (no latency data in bucket) or `baselineP99 == 0` (no latency in window history). These guards prevent false positives when a format switch or log silence removes latency data from the stream.
+
+`CurrentValue`, `BaselineValue`, `ThresholdUsed` are all reported in **milliseconds** for consistent alerter formatting.
+
+**Severity:** Warning if `SpikeRatio < 5`, Critical if `≥ 5`.
+
+#### `checkHostFlood` — `host_flood`
+```
+floodThreshold = float64(current.Total) × HostFloodFraction
+topHost, topCount = argmax(current.ByHost)
+if float64(topCount) > floodThreshold → emit host_flood
+```
+Linear scan over `current.ByHost` — typically O(10–100) entries per bucket, negligible cost. `OffendingHost` is set to the name of the top host. Early exit if `Total == 0` or `ByHost` is empty.
+
+**Severity:** always Critical.
+
+#### `checkSilence` — `silence`
+```
+consecutive = 0
+for i = len(snap)-1 downto 0:
+    if snap[i].Total == 0: consecutive++
+    else: break
+if consecutive ≥ SilenceThreshold → emit silence
+```
+Tail scan from newest to oldest — stops at the first non-zero bucket. This correctly measures "the last N seconds were silent" without being distorted by older active traffic. A burst an hour ago must not mask a current outage.
+
+`CurrentValue = float64(consecutive)`.
+
+**Severity:** always Critical.
+
+---
+
+### Cooldown — `emit` (internal)
+
+```go
+func (a *Analyzer) emit(out chan<- Anomaly, anomaly Anomaly) {
+    last := a.cooldown[anomaly.Kind]
+    if AlertCooldown > 0 && !last.IsZero() && time.Since(last) < AlertCooldown → return
+    anomaly.DetectedAt = time.Now()
+    a.cooldown[anomaly.Kind] = anomaly.DetectedAt
+    out <- anomaly
+}
+```
+
+**Zero-value map semantics:** `a.cooldown[kind]` returns `time.Time{}` (zero) for a kind that has never fired. `last.IsZero()` is true → the `time.Since` check is skipped → first firing always goes through. No special initialisation of the map is needed.
+
+**Per-kind independence:** Each `AnomalyKind` has its own timestamp. A `rate_spike` cooldown does not block `error_surge` from firing on the same bucket. Multiple kinds can fire simultaneously.
+
+**`AlertCooldown == 0` bypass:** If cooldown is set to zero (disabled), the `AlertCooldown > 0` guard short-circuits the entire cooldown check. Used in tests to ensure every qualifying bucket fires an alert without waiting.
+
+---
+
+### Severity Summary
+
+| Kind | Severity |
+|------|---------|
+| `rate_spike` | Warning if ratio < 10×; Critical if ≥ 10× |
+| `error_surge` | always Warning |
+| `latency_spike` | Warning if ratio < 5×; Critical if ≥ 5× |
+| `host_flood` | always Critical |
+| `silence` | always Critical |
 
 ---
 

@@ -515,6 +515,34 @@ Decisions, trade-offs, and rejected alternatives recorded as components are buil
 
 ---
 
+### `internal/analyzer` — Anomaly Detection
+
+**Proposal:** A single-goroutine `Analyzer` that receives `EventCount` buckets, pushes them into the sliding window, evaluates all five detection rules, enforces per-kind cooldown, and emits `Anomaly` values.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Evaluation trigger | **One eval per `EventCount`** — no separate ticker | The counter already fires every 1s; the analyzer simply evaluates on each received bucket; eliminates an extra goroutine and avoids a second timer that could drift relative to the counter |
+| Silence detection | **Tail scan** — count consecutive zero-total buckets from newest to oldest | Correctly captures "the last N seconds were silent" rather than "window mean is low"; a traffic burst an hour ago must not mask a current outage |
+| Cooldown state | `map[AnomalyKind]time.Time` (last-fired timestamp per kind) | Zero value of `time.Time` means "never fired"; `time.Since(zero)` is always > cooldown — no special init code needed |
+| Baseline guard | Skip all rules when `window.Len() < MinBaselineSamples` | Prevents false positives at startup when the window contains only 1–2 buckets and mean is artificially low or high |
+| Severity assignment | Hardcoded ratio thresholds inside `checkRate`/`checkLatency` | Operators tune *trigger* thresholds via config; severity is a derived signal; making severity thresholds configurable adds a UI surface with negligible operator value in v1 |
+| Baseline=0 guard | `SpikeRatio = 0` when `BaselineValue == 0` | Avoids division-by-zero and misleading infinity values during early warmup or after extended silence |
+| Host flood check | Iterate `current.ByHost`, find max count | O(hosts per bucket) — typically O(10–100) entries; no sort needed, just one linear scan |
+| Detection mode | `"ratio"` (mean × N) or `"sigma"` (mean + k × stddev), selected by `Config.DetectionMethod` | Ratio mode is intuitive and operator-tuneable; sigma mode is statistically principled for bursty traffic; both are implemented, operator picks via config |
+
+**Severity thresholds (hardcoded):**
+- `rate_spike`: Warning if `SpikeRatio < 10`, Critical if `≥ 10`
+- `latency_spike`: Warning if `SpikeRatio < 5`, Critical if `≥ 5`
+- `error_surge`: always Warning
+- `host_flood`: always Critical
+- `silence`: always Critical
+
+**Rejected:** A separate evaluation ticker — would require synchronising with the counter ticker to avoid double-evaluating the same window state; one-eval-per-bucket is simpler and correct.
+
+**Rejected:** Per-kind cooldown channels or timers — a simple `map[AnomalyKind]time.Time` is sufficient; the overhead of real timers is not justified.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
