@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,13 +57,41 @@ func writeTempLog(t *testing.T, content string) string {
 	return f.Name()
 }
 
+// createEmptyLog creates an empty temp file and returns its path.
+func createEmptyLog(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "test*.log")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	return f.Name()
+}
+
+// appendToLog appends content to an existing file.
+func appendToLog(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}
+
+// buildLines generates n nginx log lines.
+func buildLines(n int, ip, path string, status int, latency float64) string {
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString(nginxLine(ip, path, status, latency))
+	}
+	return sb.String()
+}
+
 // defaultCfg returns a config suitable for pipeline tests:
 // small window, no cooldown, very low baseline requirement, fast bucket.
 func defaultCfg(t *testing.T, logFile string) config.Config {
 	t.Helper()
 	cfg := *config.Default()
 	cfg.LogFile = logFile
-	cfg.Follow = false           // read-to-EOF mode, no polling
+	cfg.Follow = false // read-to-EOF mode, no polling
 	cfg.Format = "nginx"
 	cfg.BucketDuration = 100 * time.Millisecond
 	cfg.WindowSize = time.Second
@@ -74,6 +103,22 @@ func defaultCfg(t *testing.T, logFile string) config.Config {
 	cfg.LatencyMultiplier = 2.0
 	cfg.SilenceThreshold = 2
 	return cfg
+}
+
+// streamingCfg returns a defaultCfg with follow=true for live-write tests.
+func streamingCfg(t *testing.T, logFile string) config.Config {
+	t.Helper()
+	cfg := defaultCfg(t, logFile)
+	cfg.Follow = true
+	cfg.PollInterval = 20 * time.Millisecond // fast polling so writes are seen quickly
+	return cfg
+}
+
+// runPipeline starts the pipeline in a goroutine and returns a done channel.
+func runPipeline(ctx context.Context, cfg config.Config, al alerter.Alerter) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- pipeline.New(cfg, al).Run(ctx) }()
+	return done
 }
 
 // nginxLine produces a single nginx combined log line.
@@ -118,43 +163,49 @@ func TestPipeline_Run_ReturnsErrorOnMissingFile(t *testing.T) {
 }
 
 func TestPipeline_Run_ParsesAndDeliversAnomaly(t *testing.T) {
-	// Build a log file: 5 baseline lines at low rate, then a burst of 200 lines.
-	var content string
-	for i := 0; i < 5; i++ {
-		content += nginxLine("1.2.3.4", "/", 200, 0.010)
-	}
-	for i := 0; i < 200; i++ {
-		content += nginxLine("1.2.3.4", "/", 200, 0.010)
-	}
-	path := writeTempLog(t, content)
-
+	// Streaming test: baseline lines → wait → spike lines → verify anomaly.
+	path := createEmptyLog(t)
 	cap := &captureAlerter{}
-	cfg := defaultCfg(t, path)
+	cfg := streamingCfg(t, path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	done := runPipeline(ctx, cfg, cap)
+
+	// Phase 1: baseline (5 lines at low rate).
+	appendToLog(t, path, buildLines(5, "1.2.3.4", "/", 200, 0.010))
+	time.Sleep(300 * time.Millisecond) // 3 bucket intervals → baseline in window
+
+	// Phase 2: spike (200 lines in one burst).
+	appendToLog(t, path, buildLines(200, "1.2.3.4", "/", 200, 0.010))
+	time.Sleep(300 * time.Millisecond) // let anomaly be detected and delivered
+
+	cancel()
+	require.NoError(t, <-done)
 	assert.NotEmpty(t, cap.all(), "should detect and deliver at least one anomaly")
 }
 
 func TestPipeline_Run_DeliversRateSpikeKind(t *testing.T) {
-	var content string
-	for i := 0; i < 5; i++ {
-		content += nginxLine("1.2.3.4", "/", 200, 0.010)
-	}
-	for i := 0; i < 200; i++ {
-		content += nginxLine("1.2.3.4", "/", 200, 0.010)
-	}
-	path := writeTempLog(t, content)
-
+	path := createEmptyLog(t)
 	cap := &captureAlerter{}
-	cfg := defaultCfg(t, path)
+	cfg := streamingCfg(t, path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	done := runPipeline(ctx, cfg, cap)
+
+	// Baseline.
+	appendToLog(t, path, buildLines(5, "1.2.3.4", "/", 200, 0.010))
+	time.Sleep(300 * time.Millisecond)
+
+	// Spike.
+	appendToLog(t, path, buildLines(200, "1.2.3.4", "/", 200, 0.010))
+	time.Sleep(300 * time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
 
 	kinds := map[analyzer.AnomalyKind]bool{}
 	for _, a := range cap.all() {
@@ -164,24 +215,25 @@ func TestPipeline_Run_DeliversRateSpikeKind(t *testing.T) {
 }
 
 func TestPipeline_Run_DeliversErrorSurge(t *testing.T) {
-	var content string
-	// Baseline: 10 normal lines.
-	for i := 0; i < 10; i++ {
-		content += nginxLine("1.2.3.4", "/", 200, 0.010)
-	}
-	// Surge: 50 error lines (100% error rate).
-	for i := 0; i < 50; i++ {
-		content += nginxLine("1.2.3.4", "/login", 500, 0.010)
-	}
-	path := writeTempLog(t, content)
-
+	path := createEmptyLog(t)
 	cap := &captureAlerter{}
-	cfg := defaultCfg(t, path)
+	cfg := streamingCfg(t, path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	done := runPipeline(ctx, cfg, cap)
+
+	// Baseline: 10 normal lines.
+	appendToLog(t, path, buildLines(10, "1.2.3.4", "/", 200, 0.010))
+	time.Sleep(300 * time.Millisecond)
+
+	// Surge: 50 error lines (100% error rate in this bucket).
+	appendToLog(t, path, buildLines(50, "1.2.3.4", "/login", 500, 0.010))
+	time.Sleep(300 * time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
 
 	kinds := map[analyzer.AnomalyKind]bool{}
 	for _, a := range cap.all() {
@@ -191,27 +243,31 @@ func TestPipeline_Run_DeliversErrorSurge(t *testing.T) {
 }
 
 func TestPipeline_Run_DeliversHostFlood(t *testing.T) {
-	var content string
-	// Baseline: distributed traffic.
-	for i := 0; i < 10; i++ {
-		content += nginxLine(fmt.Sprintf("10.0.0.%d", i+1), "/", 200, 0.010)
-	}
-	// Flood: single IP dominates.
-	for i := 0; i < 100; i++ {
-		content += nginxLine("9.9.9.9", "/", 200, 0.010)
-	}
-	for i := 0; i < 5; i++ {
-		content += nginxLine("1.1.1.1", "/", 200, 0.010)
-	}
-	path := writeTempLog(t, content)
-
+	path := createEmptyLog(t)
 	cap := &captureAlerter{}
-	cfg := defaultCfg(t, path)
+	cfg := streamingCfg(t, path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	done := runPipeline(ctx, cfg, cap)
+
+	// Baseline: distributed traffic from 10 IPs.
+	var baseline strings.Builder
+	for i := 0; i < 10; i++ {
+		baseline.WriteString(nginxLine(fmt.Sprintf("10.0.0.%d", i+1), "/", 200, 0.010))
+	}
+	appendToLog(t, path, baseline.String())
+	time.Sleep(300 * time.Millisecond)
+
+	// Flood: single IP dominates (100/105 = 95%).
+	flood := buildLines(100, "9.9.9.9", "/", 200, 0.010) +
+		buildLines(5, "1.1.1.1", "/", 200, 0.010)
+	appendToLog(t, path, flood)
+	time.Sleep(300 * time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
 
 	kinds := map[analyzer.AnomalyKind]bool{}
 	for _, a := range cap.all() {
