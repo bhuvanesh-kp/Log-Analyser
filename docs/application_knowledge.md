@@ -18,6 +18,7 @@ Each section covers: purpose, data structures, every function, and key implement
 9. [internal/alerter — Alert Delivery](#internalalerter--alert-delivery)
 10. [internal/pipeline — Goroutine Wiring and Lifecycle](#internalpipeline--goroutine-wiring-and-lifecycle)
 11. [internal/metrics — Prometheus Metrics Exposition](#internalmetrics--prometheus-metrics-exposition)
+12. [configs/default.yaml — Reference Configuration](#configsdefaultyaml--reference-configuration)
 
 ---
 
@@ -1501,3 +1502,94 @@ In production, `main()` calls `cmd.Execute()` which provides no context, so the 
 - **Config validation rules** — implemented in `config.Validate()`
 - **Alerter retry logic** — handled inside `WebhookAlerter.Send()`
 - **Ordered shutdown** — handled by `pipeline.Run()` via defer-close cascade
+
+---
+
+## configs/default.yaml — Reference Configuration
+
+**File:** `configs/default.yaml`
+
+**Purpose:** A fully commented YAML file mirroring every field from `config.Default()` with production-safe values. Serves as a copy-and-customise starting point for operators.
+
+---
+
+### Usage
+
+```bash
+cp configs/default.yaml myconfig.yaml
+# Edit myconfig.yaml to taste
+loganalyser -c myconfig.yaml
+```
+
+---
+
+### Structure
+
+The file is organised into six sections, matching the operator's mental model:
+
+| Section | Fields | Notes |
+|---------|--------|-------|
+| **Input** | `log_file`, `format`, `follow`, `poll_interval` | What to read and how |
+| **Sliding window & aggregation** | `window_size`, `bucket_duration` | Baseline computation parameters |
+| **Detection thresholds** | `spike_threshold_multiplier`, `error_rate_threshold`, `host_flood_fraction`, `latency_multiplier`, `silence_threshold_seconds`, `min_baseline_samples`, `detection_method` | All anomaly trigger knobs |
+| **Alert suppression** | `alert_cooldown` | Per-kind duplicate suppression |
+| **Alerters** | `alerters.console.*`, `alerters.webhook.*`, `alerters.file.*` | Nested block per alerter type |
+| **Observability** | `metrics_addr`, `parser_workers` | Prometheus endpoint and parallelism |
+
+---
+
+### Key Fields and Defaults
+
+| YAML Key | Go Field | Default | Type |
+|----------|----------|---------|------|
+| `log_file` | `Config.LogFile` | `""` (stdin) | string |
+| `format` | `Config.Format` | `"auto"` | string |
+| `follow` | `Config.Follow` | `true` | bool |
+| `poll_interval` | `Config.PollInterval` | `"100ms"` | duration |
+| `window_size` | `Config.WindowSize` | `"60s"` | duration |
+| `bucket_duration` | `Config.BucketDuration` | `"1s"` | duration |
+| `spike_threshold_multiplier` | `Config.SpikeMultiplier` | `3.0` | float64 |
+| `error_rate_threshold` | `Config.ErrorRateThreshold` | `0.05` | float64 |
+| `host_flood_fraction` | `Config.HostFloodFraction` | `0.5` | float64 |
+| `latency_multiplier` | `Config.LatencyMultiplier` | `3.0` | float64 |
+| `silence_threshold_seconds` | `Config.SilenceThreshold` | `30` | int |
+| `min_baseline_samples` | `Config.MinBaselineSamples` | `10` | int |
+| `detection_method` | `Config.DetectionMethod` | `"ratio"` | string |
+| `alert_cooldown` | `Config.AlertCooldown` | `"30s"` | duration |
+| `alerters.console.enabled` | `Config.Alerters.Console.Enabled` | `true` | bool |
+| `alerters.console.use_color` | `Config.Alerters.Console.UseColor` | `true` | bool |
+| `alerters.webhook.enabled` | `Config.Alerters.Webhook.Enabled` | `false` | bool |
+| `alerters.webhook.url` | `Config.Alerters.Webhook.URL` | `""` | string |
+| `alerters.webhook.timeout` | `Config.Alerters.Webhook.Timeout` | `"5s"` | duration |
+| `alerters.webhook.max_retries` | `Config.Alerters.Webhook.MaxRetries` | `3` | int |
+| `alerters.webhook.retry_delay` | `Config.Alerters.Webhook.RetryDelay` | `"2s"` | duration |
+| `alerters.file.enabled` | `Config.Alerters.File.Enabled` | `false` | bool |
+| `alerters.file.path` | `Config.Alerters.File.Path` | `""` | string |
+| `alerters.file.format` | `Config.Alerters.File.Format` | `"json"` | string |
+| `alerters.file.max_size_mb` | `Config.Alerters.File.MaxSizeMB` | `50` | int |
+| `metrics_addr` | `Config.MetricsAddr` | `""` | string |
+| `parser_workers` | `Config.ParserWorkers` | `0` (NumCPU) | int |
+
+---
+
+### Secret Handling
+
+The `alerters.webhook.secret` field is **intentionally absent** from the YAML. It appears only as a comment:
+```yaml
+# secret: use LOG_ANALYSER_WEBHOOK_SECRET env var — never put secrets here
+```
+
+If a user adds `secret: "my-key"` to the file, `config.LoadFile` returns a `*SecretInFileError` before any env vars are applied — the secret never reaches the running config.
+
+---
+
+### Guard Tests
+
+Two tests in `config_test.go` protect against drift:
+
+| Test | What It Catches |
+|------|-----------------|
+| `TestDefaultYAML_LoadsAndValidates` | YAML syntax errors, unknown field types, validation failures (e.g. someone sets `error_rate_threshold: 2.0`) |
+| `TestDefaultYAML_MatchesDefaults` | Value drift — compares 15 key fields from the loaded YAML against `config.Default()`; fails if someone updates Go defaults without updating the YAML or vice versa |
+
+Both tests use a relative path (`../../configs/default.yaml`) and skip gracefully if the file is absent.

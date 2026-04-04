@@ -318,25 +318,36 @@ Config & Observability:
 
 ## Configuration (`configs/default.yaml`)
 
+Copy and customise for your environment:
+```bash
+cp configs/default.yaml myconfig.yaml
+loganalyser -c myconfig.yaml
+```
+
 ```yaml
-log_file: ""
-format: "auto"
-follow: true
-poll_interval: "100ms"
+# Input
+log_file: ""              # Path to log file (empty = stdin)
+format: "auto"            # nginx | apache | json | syslog | auto
+follow: true              # Keep tailing after EOF
+poll_interval: "100ms"    # Tailer poll interval
 
-window_size: "60s"
-bucket_duration: "1s"
+# Sliding window & aggregation
+window_size: "60s"        # Baseline computation window
+bucket_duration: "1s"     # Aggregation bucket size
 
-spike_threshold_multiplier: 3.0
-error_rate_threshold: 0.05
-host_flood_fraction: 0.5
-latency_multiplier: 3.0
-silence_threshold_seconds: 30
-min_baseline_samples: 10
-detection_method: "ratio"   # "ratio" | "sigma"
+# Detection thresholds
+spike_threshold_multiplier: 3.0    # Rate spike: rate > mean x N
+error_rate_threshold: 0.05         # Error surge: error fraction > N
+host_flood_fraction: 0.5           # Host flood: single IP > N of traffic
+latency_multiplier: 3.0            # Latency spike: p99 > baseline x N
+silence_threshold_seconds: 30      # Silence: zero events for N seconds
+min_baseline_samples: 10           # Buckets before alerting starts
+detection_method: "ratio"          # "ratio" (mean x N) | "sigma" (mean + k*stddev)
 
-alert_cooldown: "30s"
+# Alert suppression
+alert_cooldown: "30s"     # Per-kind duplicate suppression
 
+# Alerters
 alerters:
   console:
     enabled: true
@@ -344,18 +355,24 @@ alerters:
   webhook:
     enabled: false
     url: ""
-    secret: ""
+    # secret: use LOG_ANALYSER_WEBHOOK_SECRET env var — never put secrets here
     timeout: "5s"
     max_retries: 3
+    retry_delay: "2s"
   file:
     enabled: false
-    path: "alerts.jsonl"
+    path: ""
     format: "json"
+    max_size_mb: 50
 
-metrics_addr: ""
+# Observability
+metrics_addr: ""          # Prometheus /metrics address (e.g. ":9090")
+parser_workers: 0         # Parser goroutines (0 = NumCPU)
 ```
 
-> CLI flags override config file values. Environment variables (`LOG_ANALYSER_SPIKE_MULTIPLIER`, etc.) also override config.
+> **Precedence** (highest wins): CLI flags > environment variables > config file > built-in defaults.
+>
+> Secrets (webhook secret) must **never** appear in config files. Use `LOG_ANALYSER_WEBHOOK_SECRET` env var instead — the loader rejects files containing secrets.
 
 ---
 
@@ -694,6 +711,23 @@ ctx.Cancel()
 **Rejected:** `os.Signal` channel + manual select — `signal.NotifyContext` is cleaner (one line) and returns a context that integrates directly with the pipeline.
 
 **Rejected:** Webhook secret via `--webhook-secret` flag — command-line args are visible in process listings and shell history; env-var-only is the safe default, already enforced by `config.checkForFileSecrets`.
+
+---
+
+### `configs/default.yaml` — Reference Configuration
+
+**Proposal:** A fully commented YAML file that mirrors every field from `config.Default()` with production-safe values. Serves as a copy-and-customise starting point for operators.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| All fields explicit | Every `Config` field present with its default value | Operators can see and tune every knob without reading source code; no hidden defaults |
+| Grouped by concern | Sections: Input, Sliding window, Detection thresholds, Alert suppression, Alerters, Observability | Matches the mental model of configuring the tool; easier to find related settings |
+| Secret field commented out | `# secret: use LOG_ANALYSER_WEBHOOK_SECRET env var` | Prevents accidental secret commit; `config.LoadFile` rejects files containing the secret field |
+| Inline comments | One-line description per field | Eliminates need to cross-reference README or `--help` for common tuning |
+| Guard tests | `TestDefaultYAML_LoadsAndValidates` + `TestDefaultYAML_MatchesDefaults` in config_test.go | Catches YAML syntax errors and drift between the file and `config.Default()` — CI fails if someone updates Go defaults without updating the YAML |
+| `retry_delay` and `max_size_mb` included | Fields present even though not yet wired in all code paths | Documents the full config surface; forward-compatible with future implementation |
+
+**Rejected:** Auto-generating the YAML from `config.Default()` at build time — adds build complexity, loses human-written comments and grouping, and makes the file harder to version-control meaningfully.
 
 ---
 
