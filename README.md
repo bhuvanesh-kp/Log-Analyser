@@ -639,6 +639,31 @@ ctx.Cancel()
 
 ---
 
+### `cmd/loganalyser` — CLI Entry Point
+
+**Proposal:** A single Cobra root command (no subcommands) that wires config loading, alerter construction, metrics server, signal handling, and pipeline startup. No business logic — pure orchestration. Flag → env → file → default precedence via Viper.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| No subcommands | Single root command | The tool does one thing (tail + analyze + alert); a `run` verb adds ceremony with no value; `--version` is a flag |
+| Flag precedence | flag > env > file > default | Standard 4-layer precedence; Viper handles file + env; Cobra flags bound via `viper.BindPFlags` override naturally; `config.Load` already implements this |
+| Alerter construction in main | Pipeline accepts `alerter.Alerter`; main builds the `MultiAlerter` | Keeps pipeline testable with a mock alerter; main decides which alerters are enabled based on config |
+| ConsoleAlerter always enabled | Terminal output is the baseline UX | Webhook and file alerters are additive when their config keys are set |
+| `signal.NotifyContext` for shutdown | Single line creates a ctx cancelled on SIGINT/SIGTERM | No manual channel + select; pipeline already reacts to ctx cancellation; available since Go 1.16 |
+| Exit code convention | 0 on clean shutdown, 1 on error | `Run` returns nil on ctx cancel or EOF; non-nil means unrecoverable (file not found, bad config) |
+| Recorder passed to pipeline | `New(cfg, alerter, recorder)` | If `--metrics-addr` is empty, pass `NoopRecorder{}`; no conditional logic inside pipeline |
+| Structured logging via slog | `slog.SetDefault` with `LevelInfo` or `LevelDebug` (if `--verbose`) | All pipeline stages already use `slog`; no third-party logger needed |
+| Version via ldflags | `var version = "dev"`, set via `-ldflags "-X main.version=..."` at build time | `--version` prints and exits; no version file to maintain |
+| Webhook secret env-only | `LOG_ANALYSER_WEBHOOK_SECRET` — no `--webhook-secret` flag | Secrets on the command line are visible in `ps` and shell history; `config.Load` rejects secrets in YAML files |
+
+**Rejected:** Subcommands (`run`, `validate`, `version`) — over-engineering for a single-purpose CLI; config validation happens implicitly on startup; `--version` is a flag.
+
+**Rejected:** `os.Signal` channel + manual select — `signal.NotifyContext` is cleaner (one line) and returns a context that integrates directly with the pipeline.
+
+**Rejected:** Webhook secret via `--webhook-secret` flag — command-line args are visible in process listings and shell history; env-var-only is the safe default, already enforced by `config.checkForFileSecrets`.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
