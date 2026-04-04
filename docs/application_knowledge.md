@@ -16,6 +16,7 @@ Each section covers: purpose, data structures, every function, and key implement
 7. [internal/config — Configuration Loading](#internalconfig--configuration-loading)
 8. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
 9. [internal/alerter — Alert Delivery](#internalalerter--alert-delivery)
+10. [internal/pipeline — Goroutine Wiring and Lifecycle](#internalpipeline--goroutine-wiring-and-lifecycle)
 
 ---
 
@@ -1023,3 +1024,145 @@ return errors.Join(errs...)
 ```
 
 `offending_host` is absent when not a `host_flood` anomaly (`omitempty`). `alert_id` is present only in the webhook payload (embedded struct); the file alerter writes the `Anomaly` struct directly without a wrapper.
+
+---
+
+## internal/pipeline — Goroutine Wiring and Lifecycle
+
+**File:** `internal/pipeline/pipeline.go`
+
+**Purpose:** Owns all inter-stage channels, constructs every component from `config.Config`, starts all goroutines via a single `Run(ctx)` method, and implements ordered shutdown that guarantees no detected anomalies are dropped. This is the only file that imports all stage packages — no other component needs to know the full topology.
+
+---
+
+### Data Structure
+
+#### `Pipeline` (public)
+```go
+type Pipeline struct {
+    cfg     config.Config
+    alerter alerter.Alerter   // typically a MultiAlerter
+}
+```
+
+The pipeline does not store channels or stage references as struct fields. All channels and stages are created inside `Run` — they are local variables scoped to the lifetime of a single `Run` invocation. This prevents accidental reuse of closed channels if `Run` were called twice (it shouldn't be, but the design is defensive).
+
+---
+
+### Functions
+
+#### `New(cfg config.Config, al alerter.Alerter) *Pipeline`
+Pure construction — stores config and alerter. No goroutines, no channels, no I/O. The alerter is injected by the caller (`main.go`) after constructing the appropriate `MultiAlerter` from enabled alerter configs.
+
+#### `(*Pipeline).Run(ctx context.Context) error`
+The single blocking entry point. Returns `nil` on clean shutdown, or an error if the log file cannot be opened.
+
+**Execution flow:**
+
+1. **Preflight check:** If `cfg.LogFile != ""` (not stdin), calls `os.Open(cfg.LogFile)` and returns immediately with a wrapped error if the file does not exist or is unreadable. The file handle is closed immediately — the tailer will re-open it when it starts.
+
+2. **Channel allocation:**
+   ```
+   rawC  chan tailer.RawLine      buffer 1024
+   evtC  chan parser.ParsedEvent  buffer 512
+   cntC  chan counter.EventCount  buffer 64
+   anomC chan analyzer.Anomaly    buffer 32
+   ```
+   All channels are created here. No stage creates or closes a channel — that is the pipeline's exclusive responsibility.
+
+3. **Stage construction:**
+   - `tailer.New(cfg.LogFile, cfg.Follow, cfg.PollInterval)`
+   - `parser.NewPool(cfg.Format, workers)` — workers defaults to `runtime.NumCPU()` if `cfg.ParserWorkers < 1`
+   - `counter.New(cfg.BucketDuration)`
+   - `window.New(int(cfg.WindowSize / cfg.BucketDuration))`
+   - `analyzer.New(cfg, win)`
+
+4. **Context derivation — `ctrCtx`:**
+   ```go
+   ctrCtx, ctrCancel := context.WithCancel(ctx)
+   ```
+   The counter receives `ctrCtx` instead of the parent `ctx`. `ctrCancel` is called from two places:
+   - The parser pool goroutine calls `ctrCancel()` after `pool.Run` returns — this handles the `follow=false` (natural EOF) case where `ctx` is never cancelled.
+   - The counter goroutine calls `defer ctrCancel()` — idempotent safety net.
+
+   **Why this is needed:** When `follow=false`, the tailer reads to EOF and exits, which cascades through the pool (rawC closes → workers exit → evtC closes). The counter sets `in = nil` when evtC closes but does not exit — it keeps running its ticker loop, waiting for `ctx.Done()`. Without `ctrCancel()`, the counter would loop forever since no one cancels the parent context. Deriving `ctrCtx` and cancelling it when the pool exits solves this cleanly.
+
+5. **Goroutine topology — 5 goroutines, each wrapped with `defer close(outputChan)`:**
+
+   | # | Stage | Input | Output | Context | Exit trigger |
+   |---|-------|-------|--------|---------|-------------|
+   | 1 | Tailer | file/stdin | rawC | `ctx` | `ctx.Done()` or EOF (follow=false) |
+   | 2 | Parser pool | rawC | evtC | `ctx` | rawC closes (all workers see `!ok`) |
+   | 3 | Counter | evtC | cntC | `ctrCtx` | `ctrCtx.Done()` (fires on SIGTERM or pool exit) |
+   | 4 | Analyzer | cntC | anomC | `context.Background()` | cntC closes (`!ok` branch) |
+   | 5 | Alert loop | anomC | — | `ctx` | anomC closes (`range` exits) |
+
+   Each goroutine adds to a shared `sync.WaitGroup` and calls `defer wg.Done()`.
+
+6. **`wg.Wait()`** — blocks until all 5 goroutines have exited.
+
+7. **Alerter cleanup:** After `wg.Wait()`, type-asserts the alerter to `io.Closer`. If the assertion succeeds (e.g. `FileAlerter`), calls `Close()` to release the file handle. Errors from `Close()` are logged via `slog.Warn` but do not change the return value.
+
+---
+
+### Ordered Shutdown Cascade
+
+The shutdown wave propagates downstream via `defer close(ch)` in each goroutine:
+
+```
+ctx.Cancel() (SIGTERM) or EOF (follow=false)
+  │
+  ▼  goroutine 1: tailer.Run returns
+  │  └─ defer close(rawC)
+  ▼  goroutine 2: pool.Run returns (workers drain rawC → see !ok → exit)
+  │  └─ defer close(evtC)
+  │  └─ defer ctrCancel()        ← wakes counter for follow=false case
+  ▼  goroutine 3: counter.Run returns (ctrCtx.Done → drains evtC → flushes final bucket)
+  │  └─ defer close(cntC)
+  ▼  goroutine 4: analyzer.Run returns (cntC closed → !ok branch)
+  │  └─ defer close(anomC)
+  ▼  goroutine 5: alert loop returns (range anomC exits)
+  │
+  ▼  wg.Wait() unblocks
+  │  → alerter.Close() if io.Closer
+  │  → Run returns nil
+```
+
+**Why the analyzer uses `context.Background()`:** If the analyzer received the same `ctx` as the tailer, it would exit immediately on `ctx.Done()` — potentially before the counter has flushed its final bucket into cntC. By using `context.Background()`, the analyzer only exits when cntC is closed (which happens *after* the counter has finished draining and flushing). This ensures no final-bucket anomalies are lost.
+
+**Why the alert loop uses `range anomC`:** `range` blocks until the channel is closed, guaranteeing every anomaly queued before shutdown is delivered to the alerter before `Run` returns. No anomaly is silently dropped.
+
+---
+
+### Alert Loop
+
+```go
+for a := range anomC {
+    if err := p.alerter.Send(ctx, a); err != nil {
+        slog.Error("alert delivery failed", ...)
+    }
+}
+```
+
+The loop passes `ctx` to `Send`, so webhook retries respect the parent context's cancellation. If `ctx` is already cancelled when an anomaly arrives, the `MultiAlerter`'s goroutines will abort quickly (webhook `Send` checks `ctx.Done()` before each retry sleep). Console and file alerters ignore the context — their `Send` is synchronous and instant.
+
+Errors from `Send` are logged but do not stop the loop — a failed webhook delivery must not prevent the next anomaly from being attempted.
+
+---
+
+### Channel Buffer Sizes
+
+| Channel | Buffer | Rationale |
+|---------|--------|-----------|
+| rawC | 1024 | Absorbs bursty file reads; the tailer can read thousands of lines per poll cycle |
+| evtC | 512 | Parser pool is N× concurrent; smaller buffer since events are consumed immediately by the counter |
+| cntC | 64 | Counter emits one bucket per `BucketDuration` (typically 1/s); 64 seconds of backpressure headroom |
+| anomC | 32 | Anomalies are rare events (at most 5 kinds per bucket × cooldown filtering); 32 is ample |
+
+---
+
+### What is NOT in pipeline
+
+- **Signal handling** — `main.go` owns `signal.NotifyContext`; it passes an already-cancellable `ctx` to `Run`.
+- **Config validation** — done in `main.go` before `New` is called.
+- **Metrics exposition** — `internal/metrics` will tap the pipeline's data via separate channels or atomic counters; not wired here yet.
