@@ -639,6 +639,39 @@ ctx.Cancel()
 
 ---
 
+### `internal/pipeline` — Metrics Wiring
+
+**Proposal:** Instrument the pipeline with `Recorder` method calls using forwarding goroutines between stages and a periodic channel-depth sampler. All wiring lives in `pipeline.go` — no changes to tailer, parser, counter, analyzer, or metrics packages.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Wiring location | All `Recorder` calls in `pipeline.go` only | Stages remain decoupled from the metrics package; no new imports in tailer/parser/counter/analyzer; instrumentation is visible in one place |
+| Per-line counting | Forwarding goroutines between stages: `instrRawC → rawC` and `instrEvtC → evtC` | Each forwarding goroutine reads from the instrumented channel, calls `rec.IncLinesRead()` / `rec.IncLinesParsed()`, and forwards to the real channel; zero changes to `tailer.Run` or `pool.Run` signatures |
+| Counter output tap | Forwarding goroutine between `instrCntC → cntC` calls `rec.SetEventsPerSecond(ec.Total)` and `rec.SetBaselineRate(window.Mean(snap))` | `SetEventsPerSecond` reads `ec.Total` directly; `SetBaselineRate` takes a window snapshot — `Window` is already thread-safe (`RWMutex`) so the forwarding goroutine can safely read while the analyzer writes |
+| Anomaly + alert metrics | Added directly in the existing alert loop (Stage 5) | `rec.ObserveAnomaly(string(a.Kind))` before send; `rec.IncAlertsSent(p.alerter.Name())` after successful send; no extra goroutine needed |
+| Channel depth sampler | New goroutine with 1-second `time.Ticker`, samples `len(ch)` for all 4 channels | `rec.SetChannelDepth("raw", len(rawC))` etc.; exits on ctx cancellation; lightweight — one goroutine, one timer, four gauge sets per second |
+| Shutdown ordering | Forwarding goroutines exit when input channel closes, then close output channel | Preserves the existing drain guarantee: tailer → parser → counter → analyzer → alert loop; forwarding goroutines are transparent pipeline stages |
+| Goroutine count impact | +4 goroutines (3 forwarding + 1 sampler) | Negligible overhead; all shut down cleanly via channel close propagation (forwarding) or ctx cancellation (sampler) |
+| Window access in forwarding goroutine | Forwarding goroutine between counter and analyzer holds a reference to `*window.Window` | `Window.Snapshot()` is `RLock`-protected; the analyzer calls `Push()` under a write lock; no data race; the forwarding goroutine only reads |
+
+**Instrumented channel flow:**
+```
+[Tailer] → instrRawC → [fwd: IncLinesRead] → rawC → [Parser Pool]
+         → instrEvtC → [fwd: IncLinesParsed] → evtC → [Counter]
+         → instrCntC → [fwd: SetEventsPerSecond, SetBaselineRate] → cntC → [Analyzer]
+         → anomC → [Alert loop: ObserveAnomaly, IncAlertsSent]
+
+[Channel Depth Sampler] — 1s ticker, samples len() of all 4 channels
+```
+
+**Rejected:** Passing `Recorder` to each stage — couples every package to metrics, makes testing harder, changes existing function signatures.
+
+**Rejected:** Atomic counters in pipeline scraped on a ticker — loses per-event accuracy, adds complexity with no benefit over direct `Recorder` calls.
+
+**Rejected:** Single metrics goroutine receiving from a dedicated channel — requires all stages to send to yet another channel; more complex than direct forwarding.
+
+---
+
 ### `cmd/loganalyser` — CLI Entry Point
 
 **Proposal:** A single Cobra root command (no subcommands) that wires config loading, alerter construction, metrics server, signal handling, and pipeline startup. No business logic — pure orchestration. Flag → env → file → default precedence via Viper.
