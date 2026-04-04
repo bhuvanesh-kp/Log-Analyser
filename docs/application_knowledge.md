@@ -1316,3 +1316,139 @@ main.go:
 ```
 
 Pipeline calls `rec.IncLinesRead()` etc. inside `Run`. The `Recorder` interface means pipeline code has no `if metricsEnabled` conditionals — the noop path is handled by the type system.
+
+---
+
+## cmd/loganalyser — CLI Entry Point
+
+**File:** `cmd/loganalyser/main.go`
+
+**Purpose:** Single binary entry point that wires config loading, signal handling, alerter construction, metrics server, and pipeline startup. No business logic — pure orchestration.
+
+---
+
+### Package-Level Variables
+
+```go
+var version = "dev"
+```
+
+Set at build time via `-ldflags "-X main.version=v1.0.0"`. The `--version` flag prints this value.
+
+---
+
+### Functions
+
+#### `main()`
+
+Calls `newRootCmd().Execute()` and exits with code 1 on error.
+
+#### `newRootCmd() *cobra.Command`
+
+Builds the single Cobra root command. No subcommands.
+
+**Flag registration** (21 flags):
+
+| Flag | Short | Default | Type | Config key mapped to |
+|------|-------|---------|------|---------------------|
+| `--file` | `-f` | `""` (stdin) | string | `LogFile` |
+| `--follow` | `-F` | `true` | bool | `Follow` |
+| `--format` | | `"auto"` | string | `Format` |
+| `--window` | | `60s` | duration | `WindowSize` |
+| `--bucket` | | `1s` | duration | `BucketDuration` |
+| `--spike-multiplier` | | `3.0` | float64 | `SpikeMultiplier` |
+| `--error-rate` | | `0.05` | float64 | `ErrorRateThreshold` |
+| `--host-flood` | | `0.5` | float64 | `HostFloodFraction` |
+| `--latency-multiplier` | | `3.0` | float64 | `LatencyMultiplier` |
+| `--silence` | | `30` | int | `SilenceThreshold` |
+| `--cooldown` | | `30s` | duration | `AlertCooldown` |
+| `--min-baseline` | | `10` | int | `MinBaselineSamples` |
+| `--detection-method` | | `"ratio"` | string | `DetectionMethod` |
+| `--workers` | | `0` (NumCPU) | int | `ParserWorkers` |
+| `--webhook` | | `""` | string | `Alerters.Webhook.URL` |
+| `--alert-file` | | `""` | string | `Alerters.File.Path` |
+| `--metrics-addr` | | `""` | string | `MetricsAddr` |
+| `--config` | `-c` | `""` | string | (config file path) |
+| `--verbose` | `-v` | `false` | bool | (logging level) |
+
+**RunE execution flow:**
+
+1. `loadConfig(cmd, cfgFile)` — load from file/env, apply flag overrides, validate
+2. `setupLogging(verbose)` — configure slog level
+3. `buildAlerters(cfg)` — construct MultiAlerter
+4. `buildRecorder(cfg)` — construct Recorder + optional Server
+5. Start metrics server goroutine (if non-nil), defer `Shutdown()`
+6. Get context from `cmd.Context()` or create via `signal.NotifyContext(SIGINT, SIGTERM)`
+7. `pipeline.New(cfg, alerter, recorder).Run(ctx)`
+
+#### `loadConfig(cmd *cobra.Command, cfgFile string) (*config.Config, error)`
+
+Two paths:
+- `cfgFile != ""` → `config.Load(cfgFile)` (file + env merge)
+- `cfgFile == ""` → `config.LoadEnv()` (env + defaults only)
+
+Then calls `applyFlagOverrides(cmd, cfg)` to write CLI flag values into the config, but **only for flags that were explicitly set** (`cmd.Flags().Changed(name)`). This preserves the precedence: flag > env > file > default.
+
+Finally calls `cfg.Validate()`.
+
+#### `applyFlagOverrides(cmd *cobra.Command, cfg *config.Config)`
+
+Checks `cmd.Flags().Changed(name)` for each of 18 flags. Only overrides the config field if the user explicitly passed the flag on the command line. This prevents default flag values from overwriting file/env values.
+
+#### `setupLogging(verbose bool)`
+
+Sets `slog.SetDefault` with `LevelInfo` (default) or `LevelDebug` (when `--verbose`). Uses `slog.NewTextHandler` writing to `os.Stderr`.
+
+#### `buildAlerters(cfg config.Config) (*alerter.MultiAlerter, error)`
+
+Always includes `ConsoleAlerter(os.Stderr, cfg.Alerters.Console.UseColor)`.
+
+Conditionally adds:
+- **WebhookAlerter** — when `URL != ""` or `Enabled == true`. Passes `cfg.Alerters.Webhook.Timeout` as `http.Client` timeout and `MaxRetries` from config. Returns error if `NewWebhookAlerter` fails (e.g. empty URL with Enabled=true).
+- **FileAlerter** — when `Path != ""`. Returns error if `NewFileAlerter` fails (e.g. parent directory doesn't exist).
+
+Wraps all in `alerter.NewMultiAlerter(alerters...)`.
+
+#### `buildRecorder(cfg config.Config) (metrics.Recorder, *metrics.Server)`
+
+- `MetricsAddr == ""` → returns `(NoopRecorder{}, nil)` — zero overhead
+- `MetricsAddr != ""` → returns `(PrometheusRecorder, Server)` — caller starts server in goroutine
+
+---
+
+### Pipeline Signature Change
+
+`pipeline.New` was updated from 2 to 3 arguments:
+
+```go
+// Before
+func New(cfg config.Config, al alerter.Alerter) *Pipeline
+
+// After
+func New(cfg config.Config, al alerter.Alerter, rec metrics.Recorder) *Pipeline
+```
+
+If `rec` is nil, the constructor substitutes `metrics.NoopRecorder{}`. All existing pipeline tests pass `nil` as the third argument.
+
+---
+
+### Signal Handling
+
+```go
+ctx := cmd.Context()
+if ctx == nil {
+    ctx, cancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer cancel()
+}
+```
+
+In production, `main()` calls `cmd.Execute()` which provides no context, so the signal handler creates one. In tests, `cmd.ExecuteContext(ctx)` provides a pre-built context — no signal wiring needed, making tests deterministic.
+
+---
+
+### What is NOT in main.go
+
+- **Business logic** — all detection, parsing, alerting logic lives in `internal/` packages
+- **Config validation rules** — implemented in `config.Validate()`
+- **Alerter retry logic** — handled inside `WebhookAlerter.Send()`
+- **Ordered shutdown** — handled by `pipeline.Run()` via defer-close cascade
