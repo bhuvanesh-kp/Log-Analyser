@@ -1,0 +1,12 @@
+<134>1 2026-04-01T12:00:00Z webhost01 myapp 1234 - - Application started successfully
+<134>1 2026-04-01T12:00:01Z webhost01 myapp 1234 - - Listening on port 8080
+<134>1 2026-04-01T12:00:02Z webhost02 nginx 5678 - - Upstream connection established
+<132>1 2026-04-01T12:00:03Z webhost01 myapp 1234 - - Warning: connection pool nearing capacity (85%)
+<131>1 2026-04-01T12:00:04Z webhost01 myapp 1234 - - Error: database query timeout after 30s
+<134>1 2026-04-01T12:00:05Z webhost03 cron 9012 - - Scheduled job backup-db started
+<134>1 2026-04-01T12:00:06Z webhost01 myapp 1234 - - Request processed for user 42
+<131>1 2026-04-01T12:00:07Z webhost02 nginx 5678 - - Error: upstream returned 502
+<132>1 2026-04-01T12:00:08Z webhost01 myapp 1234 - - Warning: disk usage at 90%
+<130>1 2026-04-01T12:00:09Z webhost01 myapp 1234 - - Critical: out of memory, initiating graceful shutdown
+<134>1 2026-04-01T12:00:10Z webhost03 cron 9012 - - Scheduled job backup-db completed
+<134>1 2026-04-01T12:00:11Z webhost01 myapp 1235 - - Application restarted after OOM

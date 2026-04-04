@@ -210,7 +210,11 @@ log_analyser/
 │   ├── pipeline/pipeline.go      # Channel wiring, goroutine lifecycle
 │   └── metrics/metrics.go        # Prometheus metrics
 ├── pkg/ringbuf/ringbuf.go        # Generic circular buffer
-├── testdata/                     # Sample log files for testing
+├── testdata/
+│   ├── nginx_sample.log          # 20 lines — mixed status, latency, IPs
+│   ├── apache_sample.log         # 10 lines — CLF with auth users, 304s
+│   ├── json_sample.log           # 12 lines — all severity levels, field aliases
+│   └── syslog_sample.log         # 12 lines — RFC5424, multi-host, OOM restart
 ├── configs/default.yaml          # Default configuration
 ├── go.mod
 ├── Makefile
@@ -752,11 +756,49 @@ ctx.Cancel()
 
 ```bash
 make build            # go build → bin/loganalyser
-make test             # go test ./... -race
+make test             # go test ./... -timeout 120s
+make test-verbose     # same with -v
 make test-coverage    # coverage HTML report
+make test-coverage-func  # per-function coverage summary
 make lint             # golangci-lint
+make fmt              # go fmt
+make vet              # go vet
+make tidy             # go mod tidy
+make build-all        # cross-compile linux/darwin/windows amd64+arm64
 make docker           # docker build
+make clean            # remove bin/ and coverage files
+make help             # list all targets
 ```
+
+---
+
+## Sample Log Files (`testdata/`)
+
+Ready-to-use sample files for manual testing and demos:
+
+```bash
+# Nginx combined (20 lines — mixed status, varied latency, multiple IPs)
+loganalyser -f testdata/nginx_sample.log --format nginx --follow=false
+
+# Apache CLF (10 lines — authenticated users, 304 with - bytes)
+loganalyser -f testdata/apache_sample.log --format apache --follow=false
+
+# Structured JSON (12 lines — all severity levels, timestamp/level/latency field aliases)
+loganalyser -f testdata/json_sample.log --format json --follow=false
+
+# RFC5424 syslog (12 lines — multi-host, info/warn/error/critical, OOM restart)
+loganalyser -f testdata/syslog_sample.log --format syslog --follow=false
+
+# Auto-detect works on all four:
+loganalyser -f testdata/nginx_sample.log --follow=false
+```
+
+| File | Format | Lines | Highlights |
+|------|--------|-------|------------|
+| `nginx_sample.log` | Nginx combined | 20 | 200/301/401/404/500/503 status codes, latency 1 ms–1.5 s, health-check probes |
+| `apache_sample.log` | Apache CLF | 10 | Authenticated + anonymous users, 302 redirects, `304 -` byte field |
+| `json_sample.log` | Structured JSON | 12 | All 4 levels (info/warn/error/fatal), 3 timestamp aliases (`timestamp`/`time`/`ts`), 2 level aliases (`severity`/`lvl`), latency up to 5 s |
+| `syslog_sample.log` | RFC5424 syslog | 12 | PRI 130–134 mapping to info/warn/error/critical, 3 hosts, cron jobs, OOM restart sequence |
 
 ---
 

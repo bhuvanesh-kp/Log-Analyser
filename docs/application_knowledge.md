@@ -19,6 +19,7 @@ Each section covers: purpose, data structures, every function, and key implement
 10. [internal/pipeline — Goroutine Wiring and Lifecycle](#internalpipeline--goroutine-wiring-and-lifecycle)
 11. [internal/metrics — Prometheus Metrics Exposition](#internalmetrics--prometheus-metrics-exposition)
 12. [configs/default.yaml — Reference Configuration](#configsdefaultyaml--reference-configuration)
+13. [testdata/ — Sample Log Files](#testdata--sample-log-files)
 
 ---
 
@@ -1593,3 +1594,53 @@ Two tests in `config_test.go` protect against drift:
 | `TestDefaultYAML_MatchesDefaults` | Value drift — compares 15 key fields from the loaded YAML against `config.Default()`; fails if someone updates Go defaults without updating the YAML or vice versa |
 
 Both tests use a relative path (`../../configs/default.yaml`) and skip gracefully if the file is absent.
+
+---
+
+## testdata/ — Sample Log Files
+
+**Directory:** `testdata/`
+
+**Purpose:** Ready-to-use sample log files for manual testing, demos, and verifying that all four parsers and auto-detect work end-to-end. Each file is designed to exercise parser edge cases and contains realistic traffic patterns.
+
+---
+
+### Files
+
+| File | Format | Lines | What It Covers |
+|------|--------|-------|----------------|
+| `nginx_sample.log` | Nginx combined | 20 | 6 distinct status codes (200/301/401/404/500/503), latency from 1 ms to 1.5 s, 8 unique IPs, health-check probes (`kube-probe`), DELETE/POST methods, query strings |
+| `apache_sample.log` | Apache CLF | 10 | Authenticated (`frank`) and anonymous users, 302 redirect, `304 -` (dash for zero bytes), no referer/user-agent/latency fields (strict CLF) |
+| `json_sample.log` | Structured JSON | 12 | All 4 severity levels (info/warn/error/fatal), all 3 timestamp aliases (`timestamp`, `time`, `ts`), all 2 level aliases (`severity`, `lvl`), latency alias `duration_ms`, status codes including 429/502, latency up to 5 s |
+| `syslog_sample.log` | RFC5424 syslog | 12 | PRI values 130–134 mapping to info/warn/error/critical via `priToLevel()`, 3 distinct hostnames, 3 app names (myapp/nginx/cron), OOM crash-and-restart sequence |
+
+---
+
+### Design Choices
+
+| Decision | Rationale |
+|----------|-----------|
+| All files are static (no follow needed) | `--follow=false` exits cleanly at EOF — safe for CI, scripts, and demos |
+| Each file exercises its parser's edge cases | nginx: optional `$request_time`; apache: strict CLF without trailing groups; JSON: all field aliases; syslog: PRI-to-level mapping across severity range |
+| Realistic traffic patterns | Mixed success/error status codes, varied IPs, health checks, cron jobs — representative of production logs |
+| Line counts kept small (10–20) | Fast to process, easy to inspect manually, git-friendly |
+| JSON file includes alias variants | Lines 11–12 use `time`/`severity` and `ts`/`lvl`/`duration_ms` instead of the primary keys — verifies the alias fallback logic in `jsonParser` |
+| Syslog file includes a crash sequence | Lines 10–12 show OOM → shutdown → restart — useful for testing silence detection when combined with a time gap |
+
+---
+
+### Usage
+
+```bash
+# Explicit format
+loganalyser -f testdata/nginx_sample.log --format nginx --follow=false
+
+# Auto-detect (works on all four)
+loganalyser -f testdata/json_sample.log --follow=false
+
+# Verbose mode to see parse details
+loganalyser -f testdata/syslog_sample.log --follow=false --verbose
+
+# Pipe through stdin
+cat testdata/nginx_sample.log | loganalyser --format nginx --follow=false
+```

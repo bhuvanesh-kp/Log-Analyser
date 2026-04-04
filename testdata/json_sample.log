@@ -1,0 +1,12 @@
+{"timestamp":"2026-04-01T12:00:00Z","level":"info","host":"10.0.0.1","method":"GET","path":"/api/users","status_code":200,"latency_ms":12.5}
+{"timestamp":"2026-04-01T12:00:01Z","level":"info","host":"10.0.0.2","method":"POST","path":"/api/login","status_code":200,"latency_ms":45.0}
+{"timestamp":"2026-04-01T12:00:02Z","level":"warn","host":"10.0.0.3","method":"GET","path":"/api/products","status_code":429,"latency_ms":5.2}
+{"timestamp":"2026-04-01T12:00:03Z","level":"error","host":"10.0.0.1","method":"POST","path":"/api/orders","status_code":500,"latency_ms":350.0}
+{"timestamp":"2026-04-01T12:00:04Z","level":"info","host":"10.0.0.4","method":"GET","path":"/health","status_code":200,"latency_ms":1.0}
+{"timestamp":"2026-04-01T12:00:05Z","level":"info","host":"10.0.0.1","method":"GET","path":"/api/users","status_code":200,"latency_ms":10.8}
+{"timestamp":"2026-04-01T12:00:06Z","level":"error","host":"10.0.0.5","method":"POST","path":"/api/checkout","status_code":502,"latency_ms":1500.0}
+{"timestamp":"2026-04-01T12:00:07Z","level":"info","host":"10.0.0.2","method":"GET","path":"/api/search","status_code":200,"latency_ms":85.3}
+{"timestamp":"2026-04-01T12:00:08Z","level":"fatal","host":"10.0.0.1","method":"GET","path":"/api/orders","status_code":500,"latency_ms":5000.0}
+{"timestamp":"2026-04-01T12:00:09Z","level":"info","host":"10.0.0.6","method":"GET","path":"/","status_code":200,"latency_ms":3.2}
+{"time":"2026-04-01T12:00:10Z","severity":"error","host":"10.0.0.7","latency_ms":200.0}
+{"ts":"2026-04-01T12:00:11Z","lvl":"warn","host":"10.0.0.8","duration_ms":150.0}
