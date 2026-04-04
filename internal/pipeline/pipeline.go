@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"log_analyser/internal/alerter"
 	"log_analyser/internal/analyzer"
@@ -63,13 +64,28 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		f.Close()
 	}
 
+	rec := p.recorder
+
 	// -----------------------------------------------------------------------
 	// Channels — owned exclusively by the pipeline.
 	// -----------------------------------------------------------------------
-	rawC  := make(chan tailer.RawLine, 1024)
-	evtC  := make(chan parser.ParsedEvent, 512)
-	cntC  := make(chan counter.EventCount, 64)
-	anomC := make(chan analyzer.Anomaly, 32)
+	//
+	// Instrumented channels sit between stages. Forwarding goroutines read
+	// from the instrumented channel, call the appropriate Recorder method,
+	// and forward the item to the real stage input channel.
+	//
+	//   Tailer → instrRawC → [fwd: IncLinesRead] → rawC → Parser Pool
+	//          → instrEvtC → [fwd: IncLinesParsed] → evtC → Counter
+	//          → instrCntC → [fwd: SetEventsPerSecond, SetBaselineRate] → cntC → Analyzer
+	//          → anomC → [alert loop: ObserveAnomaly, IncAlertsSent]
+	//
+	instrRawC := make(chan tailer.RawLine, 1024)
+	rawC      := make(chan tailer.RawLine, 1024)
+	instrEvtC := make(chan parser.ParsedEvent, 512)
+	evtC      := make(chan parser.ParsedEvent, 512)
+	instrCntC := make(chan counter.EventCount, 64)
+	cntC      := make(chan counter.EventCount, 64)
+	anomC     := make(chan analyzer.Anomaly, 32)
 
 	// -----------------------------------------------------------------------
 	// Stage construction.
@@ -94,39 +110,84 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	// -----------------------------------------------------------------------
-	// Stage 1 — Tailer → rawC
+	// Stage 1 — Tailer → instrRawC
+	// -----------------------------------------------------------------------
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(instrRawC)
+		tail.Run(ctx, instrRawC)
+	}()
+
+	// -----------------------------------------------------------------------
+	// Forwarding: instrRawC → rawC (IncLinesRead)
 	// -----------------------------------------------------------------------
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(rawC)
-		tail.Run(ctx, rawC)
+		for r := range instrRawC {
+			rec.IncLinesRead()
+			rawC <- r
+		}
 	}()
 
 	// -----------------------------------------------------------------------
-	// Stage 2 — Parser pool: rawC → evtC
-	// Closing evtC signals the counter that the source is exhausted.
+	// Stage 2 — Parser pool: rawC → instrEvtC
+	// Closing instrEvtC signals downstream that the source is exhausted.
 	// Calling ctrCancel() after the pool exits wakes the counter's ctx.Done
 	// branch so it flushes the final partial bucket and returns.
 	// -----------------------------------------------------------------------
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(evtC)
+		defer close(instrEvtC)
 		defer ctrCancel() // wake counter when pool is done
-		pool.Run(ctx, rawC, evtC)
+		pool.Run(ctx, rawC, instrEvtC)
 	}()
 
 	// -----------------------------------------------------------------------
-	// Stage 3 — Counter: evtC → cntC
+	// Forwarding: instrEvtC → evtC (IncLinesParsed)
+	// -----------------------------------------------------------------------
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(evtC)
+		for e := range instrEvtC {
+			rec.IncLinesParsed()
+			evtC <- e
+		}
+	}()
+
+	// -----------------------------------------------------------------------
+	// Stage 3 — Counter: evtC → instrCntC
 	// Uses ctrCtx so it exits both on parent cancellation and on pool-done.
 	// -----------------------------------------------------------------------
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(cntC)
+		defer close(instrCntC)
 		defer ctrCancel() // idempotent — safe to call more than once
-		ctr.Run(ctrCtx, evtC, cntC)
+		ctr.Run(ctrCtx, evtC, instrCntC)
+	}()
+
+	// -----------------------------------------------------------------------
+	// Forwarding: instrCntC → cntC (SetEventsPerSecond, SetBaselineRate)
+	// The window is thread-safe (RWMutex), so Snapshot() here is safe while
+	// the analyzer goroutine calls Push().
+	// -----------------------------------------------------------------------
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(cntC)
+		for ec := range instrCntC {
+			rec.SetEventsPerSecond(float64(ec.Total))
+			snap := win.Snapshot()
+			if len(snap) > 0 {
+				rec.SetBaselineRate(window.Mean(snap))
+			}
+			cntC <- ec
+		}
 	}()
 
 	// -----------------------------------------------------------------------
@@ -146,16 +207,51 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	// Stage 5 — Alert loop: drains anomC until closed.
 	// `range anomC` guarantees every queued anomaly is delivered before this
 	// goroutine exits, which means Run only returns after all alerts are sent.
+	// ObserveAnomaly is called for every anomaly; IncAlertsSent only on
+	// successful delivery.
+	// samplerDone is closed after the alert loop exits, signalling the channel
+	// depth sampler to stop — this prevents the sampler from blocking Run in
+	// follow=false mode where ctx is never cancelled.
 	// -----------------------------------------------------------------------
+	samplerDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(samplerDone)
 		for a := range anomC {
+			rec.ObserveAnomaly(string(a.Kind))
 			if err := p.alerter.Send(ctx, a); err != nil {
 				slog.Error("alert delivery failed",
 					"alerter", p.alerter.Name(),
 					"kind", a.Kind,
 					"err", err)
+			} else {
+				rec.IncAlertsSent(p.alerter.Name())
+			}
+		}
+	}()
+
+	// -----------------------------------------------------------------------
+	// Channel depth sampler — samples len() of all 4 stage channels once per
+	// second and reports via rec.SetChannelDepth. Exits on ctx cancellation
+	// or when the alert loop completes (samplerDone closed).
+	// -----------------------------------------------------------------------
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-samplerDone:
+				return
+			case <-ticker.C:
+				rec.SetChannelDepth("raw", len(rawC))
+				rec.SetChannelDepth("parsed", len(evtC))
+				rec.SetChannelDepth("counted", len(cntC))
+				rec.SetChannelDepth("anomaly", len(anomC))
 			}
 		}
 	}()
