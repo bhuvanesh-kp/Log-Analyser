@@ -604,6 +604,41 @@ ctx.Cancel()
 
 ---
 
+### `internal/metrics` — Prometheus Metrics Exposition
+
+**Proposal:** A `Recorder` interface abstraction over Prometheus counters/gauges. Pipeline stages call `Recorder` methods (`IncLinesRead()`, `ObserveAnomaly(kind)`, etc.) for zero-cost instrumentation. A `PrometheusRecorder` implementation registers metrics on a custom (non-global) `prometheus.Registry`. A `NoopRecorder` is used when `--metrics-addr` is not set. An HTTP `Server` exposes `/metrics` with graceful shutdown.
+
+| Decision | Choice | Trade-off / Rationale |
+|----------|--------|-----------------------|
+| Instrumentation abstraction | `Recorder` interface with `PrometheusRecorder` and `NoopRecorder` implementations | Pipeline stages call `rec.IncLinesRead()` — no direct prometheus imports outside the metrics package; `NoopRecorder` is zero-cost when metrics are disabled; no nil checks needed |
+| Registry | Custom `prometheus.Registry` per `PrometheusRecorder`, not `prometheus.DefaultRegisterer` | Makes tests hermetic — no "already registered" panics across parallel test runs or multiple pipeline instances; each recorder owns its own collectors |
+| Pipeline integration | `Pipeline.New(cfg, alerter, recorder)` — recorder passed as a constructor argument | Pipeline calls recorder methods inside `Run`; if metrics are disabled, `NoopRecorder{}` is passed — no conditional logic in pipeline code |
+| Channel depth gauges | Pipeline calls `rec.SetChannelDepth(name, len(ch))` periodically | Metrics package holds no channel references — stays decoupled from pipeline internals; pipeline already owns the channels |
+| HTTP server lifecycle | `Server` wraps `http.Server`; `ListenAndServe()` blocks in a goroutine; `Shutdown(ctx)` drains in-flight scrapes | Standard `http.Server` shutdown semantics; `main.go` starts the server and calls `Shutdown` in the deferred cleanup path |
+| No server when disabled | If `--metrics-addr` is empty, `main.go` skips server creation entirely | Zero overhead; no listener, no goroutine, no port binding when metrics are not requested |
+| Metric naming | `log_analyser_` prefix on all metrics | Standard Prometheus namespace convention; avoids collisions with other exporters on the same process |
+| Label cardinality | `kind` on anomalies (5 values), `alerter` on alerts sent (3 values), `channel` on depth (4 values) | Low, bounded cardinality — no risk of label explosion; all label values are enum-like constants defined in the codebase |
+
+**Metrics exposed:**
+
+| Prometheus Name | Type | Labels | Source |
+|-----------------|------|--------|--------|
+| `log_analyser_lines_read_total` | Counter | — | Tailer (via pipeline) |
+| `log_analyser_lines_parsed_total` | Counter | — | Parser pool (via pipeline) |
+| `log_analyser_events_per_second` | Gauge | — | Counter stage (via pipeline) |
+| `log_analyser_baseline_rate` | Gauge | — | Analyzer (via pipeline) |
+| `log_analyser_anomalies_total` | Counter | `kind` | Analyzer (via pipeline) |
+| `log_analyser_alerts_sent_total` | Counter | `alerter` | Alert loop (via pipeline) |
+| `log_analyser_pipeline_channel_depth` | Gauge | `channel` | Pipeline (periodic) |
+
+**Rejected:** Global `prometheus.DefaultRegisterer` — causes "already registered" panics in parallel tests; custom registry is strictly better for testability and multi-instance safety.
+
+**Rejected:** Metrics middleware wrapping channels — would require metrics to own or wrap pipeline channels, creating tight coupling; explicit `Recorder` method calls are simpler and keep ownership clear.
+
+**Rejected:** Push-based metrics via Pushgateway — adds an external dependency and an additional failure mode; pull-based `/metrics` endpoint is the Prometheus standard for long-running services.
+
+---
+
 ## Extending the Tool
 
 ### Add a new log format parser
