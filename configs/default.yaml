@@ -1,0 +1,115 @@
+# ============================================================================
+# log_analyser — default configuration
+# ============================================================================
+#
+# Copy this file and customise for your environment:
+#   cp configs/default.yaml myconfig.yaml
+#   loganalyser -c myconfig.yaml
+#
+# Precedence (highest wins): CLI flags > env vars > this file > built-in defaults
+#
+# Secrets (webhook secret) must NEVER appear in this file.
+# Use the LOG_ANALYSER_WEBHOOK_SECRET environment variable instead.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+
+# Path to the log file to tail. Leave empty to read from stdin.
+log_file: ""
+
+# Log format: nginx | apache | json | syslog | auto
+# "auto" probes the first line and locks to the matching parser.
+format: "auto"
+
+# Keep tailing after EOF (true = tail -f behaviour).
+# Set to false to process a static file and exit.
+follow: true
+
+# How often the tailer polls for new data (only used when follow=true).
+poll_interval: "100ms"
+
+# ---------------------------------------------------------------------------
+# Sliding window & aggregation
+# ---------------------------------------------------------------------------
+
+# Size of the sliding window used for baseline computation.
+# Example: 60s window with 1s buckets = 60 data points.
+window_size: "60s"
+
+# Duration of each aggregation bucket.
+bucket_duration: "1s"
+
+# ---------------------------------------------------------------------------
+# Detection thresholds
+# ---------------------------------------------------------------------------
+
+# Rate spike: alert when current rate > mean x this multiplier.
+spike_threshold_multiplier: 3.0
+
+# Error surge: alert when error fraction exceeds this value (0.0–1.0).
+error_rate_threshold: 0.05
+
+# Host flood: alert when a single IP accounts for more than this fraction
+# of total traffic in one bucket (0.0–1.0).
+host_flood_fraction: 0.5
+
+# Latency spike: alert when p99 latency > baseline p99 x this multiplier.
+latency_multiplier: 3.0
+
+# Silence: alert after this many consecutive seconds of zero events.
+silence_threshold_seconds: 30
+
+# Minimum number of buckets in the window before any alerting begins.
+# Prevents false positives during startup when the baseline is thin.
+min_baseline_samples: 10
+
+# Detection method: "ratio" (mean x multiplier) or "sigma" (mean + k x stddev).
+detection_method: "ratio"
+
+# ---------------------------------------------------------------------------
+# Alert suppression
+# ---------------------------------------------------------------------------
+
+# Per-kind cooldown: suppress duplicate alerts of the same kind for this
+# duration after the first alert fires.
+alert_cooldown: "30s"
+
+# ---------------------------------------------------------------------------
+# Alerters
+# ---------------------------------------------------------------------------
+
+alerters:
+  # Console alerter — always active, writes coloured output to stderr.
+  console:
+    enabled: true
+    use_color: true
+
+  # Webhook alerter — HTTP POST JSON to the configured URL.
+  # Secret must be set via LOG_ANALYSER_WEBHOOK_SECRET env var, not here.
+  webhook:
+    enabled: false
+    url: ""
+    # secret: DO NOT put secrets in config files.
+    timeout: "5s"
+    max_retries: 3
+    retry_delay: "2s"
+
+  # File alerter — appends one JSON object per line (JSONL) to the given path.
+  file:
+    enabled: false
+    path: ""
+    format: "json"
+    max_size_mb: 50
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+# Prometheus /metrics HTTP listen address. Leave empty to disable.
+# Example: ":9090" or "127.0.0.1:9090"
+metrics_addr: ""
+
+# Number of parser goroutines. 0 = runtime.NumCPU().
+parser_workers: 0

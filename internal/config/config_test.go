@@ -446,3 +446,49 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// configs/default.yaml round-trip
+// ---------------------------------------------------------------------------
+
+func TestDefaultYAML_LoadsAndValidates(t *testing.T) {
+	// Verify that configs/default.yaml loads successfully and passes validation.
+	// This catches drift between the YAML file and the Config struct.
+	yamlPath := filepath.Join("..", "..", "configs", "default.yaml")
+	if _, err := os.Stat(yamlPath); os.IsNotExist(err) {
+		t.Skip("configs/default.yaml not found — skipping")
+	}
+
+	cfg, err := config.LoadFile(yamlPath)
+	require.NoError(t, err, "configs/default.yaml should load without error")
+	assert.NoError(t, cfg.Validate(), "configs/default.yaml should pass validation")
+}
+
+func TestDefaultYAML_MatchesDefaults(t *testing.T) {
+	// Verify that key values in configs/default.yaml match config.Default().
+	yamlPath := filepath.Join("..", "..", "configs", "default.yaml")
+	if _, err := os.Stat(yamlPath); os.IsNotExist(err) {
+		t.Skip("configs/default.yaml not found — skipping")
+	}
+
+	cfg, err := config.LoadFile(yamlPath)
+	require.NoError(t, err)
+
+	def := config.Default()
+
+	assert.Equal(t, def.Format, cfg.Format, "format")
+	assert.Equal(t, def.Follow, cfg.Follow, "follow")
+	assert.Equal(t, def.WindowSize, cfg.WindowSize, "window_size")
+	assert.Equal(t, def.BucketDuration, cfg.BucketDuration, "bucket_duration")
+	assert.Equal(t, def.SpikeMultiplier, cfg.SpikeMultiplier, "spike_threshold_multiplier")
+	assert.Equal(t, def.ErrorRateThreshold, cfg.ErrorRateThreshold, "error_rate_threshold")
+	assert.Equal(t, def.HostFloodFraction, cfg.HostFloodFraction, "host_flood_fraction")
+	assert.Equal(t, def.LatencyMultiplier, cfg.LatencyMultiplier, "latency_multiplier")
+	assert.Equal(t, def.SilenceThreshold, cfg.SilenceThreshold, "silence_threshold_seconds")
+	assert.Equal(t, def.AlertCooldown, cfg.AlertCooldown, "alert_cooldown")
+	assert.Equal(t, def.MinBaselineSamples, cfg.MinBaselineSamples, "min_baseline_samples")
+	assert.Equal(t, def.DetectionMethod, cfg.DetectionMethod, "detection_method")
+	assert.Equal(t, def.Alerters.Console.Enabled, cfg.Alerters.Console.Enabled, "alerters.console.enabled")
+	assert.Equal(t, def.Alerters.Webhook.Enabled, cfg.Alerters.Webhook.Enabled, "alerters.webhook.enabled")
+	assert.Equal(t, def.Alerters.File.Enabled, cfg.Alerters.File.Enabled, "alerters.file.enabled")
+}
