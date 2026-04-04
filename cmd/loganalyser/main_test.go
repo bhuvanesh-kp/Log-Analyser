@@ -143,12 +143,20 @@ func TestBuildAlerters_WebhookIncludedWhenURLSet(t *testing.T) {
 }
 
 func TestBuildAlerters_FileIncludedWhenPathSet(t *testing.T) {
-	cfg := defaultTestConfig()
-	cfg.Alerters.File.Path = filepath.Join(t.TempDir(), "alerts.jsonl")
-
-	ma, err := buildAlerters(cfg)
+	dir, err := os.MkdirTemp("", "alerter-test-*")
 	require.NoError(t, err)
+
+	cfg := defaultTestConfig()
+	cfg.Alerters.File.Path = filepath.Join(dir, "alerts.jsonl")
+
+	ma, buildErr := buildAlerters(cfg)
+	require.NoError(t, buildErr)
 	assert.NotNil(t, ma)
+
+	// Cleanup: the FileAlerter inside the MultiAlerter holds an open handle.
+	// Remove the directory after the test; ignore errors on Windows if the
+	// handle is still open (the OS will release it when the process exits).
+	t.Cleanup(func() { os.RemoveAll(dir) })
 }
 
 func TestBuildAlerters_FileReturnsErrorOnBadPath(t *testing.T) {
@@ -159,12 +167,14 @@ func TestBuildAlerters_FileReturnsErrorOnBadPath(t *testing.T) {
 	assert.Error(t, err, "should return error when file alerter path is invalid")
 }
 
-func TestBuildAlerters_WebhookReturnsErrorOnBadURL(t *testing.T) {
+func TestBuildAlerters_WebhookReturnsErrorOnEmptyURL(t *testing.T) {
 	cfg := defaultTestConfig()
-	cfg.Alerters.Webhook.URL = "://bad-url"
+	// Trigger webhook construction by enabling it, but leave URL empty.
+	cfg.Alerters.Webhook.Enabled = true
+	cfg.Alerters.Webhook.URL = ""
 
 	_, err := buildAlerters(cfg)
-	assert.Error(t, err, "should return error on invalid webhook URL")
+	assert.Error(t, err, "should return error when webhook is enabled but URL is empty")
 }
 
 // ---------------------------------------------------------------------------

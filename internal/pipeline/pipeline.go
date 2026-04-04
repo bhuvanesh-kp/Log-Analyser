@@ -13,6 +13,7 @@ import (
 	"log_analyser/internal/analyzer"
 	"log_analyser/internal/config"
 	"log_analyser/internal/counter"
+	"log_analyser/internal/metrics"
 	"log_analyser/internal/parser"
 	"log_analyser/internal/tailer"
 	"log_analyser/internal/window"
@@ -21,15 +22,20 @@ import (
 // Pipeline owns all inter-stage channels and goroutines.
 // Create with New, start with Run.
 type Pipeline struct {
-	cfg     config.Config
-	alerter alerter.Alerter
+	cfg      config.Config
+	alerter  alerter.Alerter
+	recorder metrics.Recorder
 }
 
 // New constructs a Pipeline from cfg.
 // al is the delivery target for anomalies — typically a MultiAlerter.
+// rec is the metrics recorder — use metrics.NoopRecorder{} when metrics are disabled.
 // No goroutines are started until Run is called.
-func New(cfg config.Config, al alerter.Alerter) *Pipeline {
-	return &Pipeline{cfg: cfg, alerter: al}
+func New(cfg config.Config, al alerter.Alerter, rec metrics.Recorder) *Pipeline {
+	if rec == nil {
+		rec = metrics.NoopRecorder{}
+	}
+	return &Pipeline{cfg: cfg, alerter: al, recorder: rec}
 }
 
 // Run starts all pipeline goroutines and blocks until shutdown is complete.

@@ -117,7 +117,7 @@ func streamingCfg(t *testing.T, logFile string) config.Config {
 // runPipeline starts the pipeline in a goroutine and returns a done channel.
 func runPipeline(ctx context.Context, cfg config.Config, al alerter.Alerter) <-chan error {
 	done := make(chan error, 1)
-	go func() { done <- pipeline.New(cfg, al).Run(ctx) }()
+	go func() { done <- pipeline.New(cfg, al, nil).Run(ctx) }()
 	return done
 }
 
@@ -135,7 +135,7 @@ func nginxLine(ip, path string, status int, latency float64) string {
 
 func TestPipeline_New_ReturnsNonNil(t *testing.T) {
 	cfg := *config.Default()
-	p := pipeline.New(cfg, &captureAlerter{})
+	p := pipeline.New(cfg, &captureAlerter{}, nil)
 	assert.NotNil(t, p)
 }
 
@@ -146,7 +146,7 @@ func TestPipeline_Run_ExitsCleanlyOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err := pipeline.New(cfg, &captureAlerter{}).Run(ctx)
+	err := pipeline.New(cfg, &captureAlerter{}, nil).Run(ctx)
 	assert.NoError(t, err)
 }
 
@@ -158,7 +158,7 @@ func TestPipeline_Run_ReturnsErrorOnMissingFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := pipeline.New(cfg, &captureAlerter{}).Run(ctx)
+	err := pipeline.New(cfg, &captureAlerter{}, nil).Run(ctx)
 	assert.Error(t, err, "should return error when log file does not exist")
 }
 
@@ -290,7 +290,7 @@ func TestPipeline_Run_NoAnomalyOnNormalTraffic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	require.NoError(t, pipeline.New(cfg, cap, nil).Run(ctx))
 	assert.Empty(t, cap.all(), "steady traffic should produce no anomalies")
 }
 
@@ -313,7 +313,7 @@ func TestPipeline_Run_DropsNoEventsOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	require.NoError(t, pipeline.New(cfg, cap).Run(ctx))
+	require.NoError(t, pipeline.New(cfg, cap, nil).Run(ctx))
 
 	// All anomalies must be complete (non-zero DetectedAt) — no zero-value structs.
 	for _, a := range cap.all() {
@@ -332,7 +332,7 @@ func TestPipeline_Run_ClosesFileAlerterOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	require.NoError(t, pipeline.New(cfg, fa).Run(ctx))
+	require.NoError(t, pipeline.New(cfg, fa, nil).Run(ctx))
 
 	// After Run returns the file handle must be closed.
 	// A second Close() on an already-closed file returns an error on all platforms.
@@ -352,7 +352,7 @@ func TestPipeline_Run_ReturnsAfterFileIsFullyRead(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- pipeline.New(cfg, &captureAlerter{}).Run(context.Background())
+		done <- pipeline.New(cfg, &captureAlerter{}, nil).Run(context.Background())
 	}()
 
 	select {
