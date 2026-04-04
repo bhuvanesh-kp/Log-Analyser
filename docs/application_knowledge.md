@@ -17,6 +17,7 @@ Each section covers: purpose, data structures, every function, and key implement
 8. [internal/tailer — File Tailing and Rotation](#internaltailer--file-tailing-and-rotation)
 9. [internal/alerter — Alert Delivery](#internalalerter--alert-delivery)
 10. [internal/pipeline — Goroutine Wiring and Lifecycle](#internalpipeline--goroutine-wiring-and-lifecycle)
+11. [internal/metrics — Prometheus Metrics Exposition](#internalmetrics--prometheus-metrics-exposition)
 
 ---
 
@@ -1165,4 +1166,153 @@ Errors from `Send` are logged but do not stop the loop — a failed webhook deli
 
 - **Signal handling** — `main.go` owns `signal.NotifyContext`; it passes an already-cancellable `ctx` to `Run`.
 - **Config validation** — done in `main.go` before `New` is called.
-- **Metrics exposition** — `internal/metrics` will tap the pipeline's data via separate channels or atomic counters; not wired here yet.
+- **Metrics exposition** — pipeline stages call `metrics.Recorder` methods; the metrics HTTP server is started by `main.go`, not by the pipeline.
+
+---
+
+## internal/metrics — Prometheus Metrics Exposition
+
+**File:** `internal/metrics/metrics.go`
+
+**Purpose:** Provides pipeline instrumentation via Prometheus counters and gauges. Exposes a `/metrics` HTTP endpoint for scraping. Designed around a `Recorder` interface so the pipeline is decoupled from Prometheus — a `NoopRecorder` is used when metrics are disabled.
+
+---
+
+### Recorder Interface
+
+```go
+type Recorder interface {
+    IncLinesRead()
+    IncLinesParsed()
+    SetEventsPerSecond(v float64)
+    SetBaselineRate(v float64)
+    ObserveAnomaly(kind string)
+    IncAlertsSent(alerter string)
+    SetChannelDepth(name string, depth int)
+}
+```
+
+All methods are safe to call concurrently. Pipeline stages call these methods — no direct prometheus imports outside the metrics package.
+
+---
+
+### NoopRecorder
+
+```go
+type NoopRecorder struct{}
+```
+
+All 7 methods are empty no-ops. Used when `--metrics-addr` is not set. Zero allocation, zero overhead. Satisfies `Recorder` as a value type — no pointer needed.
+
+---
+
+### PrometheusRecorder
+
+```go
+type PrometheusRecorder struct {
+    registry     *prometheus.Registry
+    linesRead    prometheus.Counter
+    linesParsed  prometheus.Counter
+    eventsPerSec prometheus.Gauge
+    baselineRate prometheus.Gauge
+    anomalies    *prometheus.CounterVec   // label: kind
+    alertsSent   *prometheus.CounterVec   // label: alerter
+    channelDepth *prometheus.GaugeVec     // label: channel
+}
+```
+
+**Key design: custom registry.** Each `PrometheusRecorder` creates its own `prometheus.Registry` instead of using `prometheus.DefaultRegisterer`. This means:
+- Parallel tests never collide ("already registered" panics impossible)
+- Multiple pipeline instances can coexist in the same process
+- The `Handler()` method serves only this recorder's metrics
+
+#### Constructor
+
+```go
+func NewPrometheusRecorder() *PrometheusRecorder
+```
+
+Creates all 7 collectors with namespace `log_analyser`, registers them on a fresh private registry, and returns the recorder. No goroutines are started.
+
+#### Methods
+
+| Method | Prometheus Type | Metric Name | Labels |
+|--------|----------------|-------------|--------|
+| `IncLinesRead()` | Counter | `log_analyser_lines_read_total` | — |
+| `IncLinesParsed()` | Counter | `log_analyser_lines_parsed_total` | — |
+| `SetEventsPerSecond(v)` | Gauge | `log_analyser_events_per_second` | — |
+| `SetBaselineRate(v)` | Gauge | `log_analyser_baseline_rate` | — |
+| `ObserveAnomaly(kind)` | Counter | `log_analyser_anomalies_total` | `kind` |
+| `IncAlertsSent(alerter)` | Counter | `log_analyser_alerts_sent_total` | `alerter` |
+| `SetChannelDepth(name, depth)` | Gauge | `log_analyser_pipeline_channel_depth` | `channel` |
+
+Counters use `Inc()` (monotonically increasing). Gauges use `Set()` (overwrites previous value).
+
+#### Handler
+
+```go
+func (r *PrometheusRecorder) Handler() http.Handler
+```
+
+Returns a `promhttp.HandlerFor` backed by the recorder's private registry. Used by `Server` and directly by tests via `httptest.NewRecorder`.
+
+---
+
+### Server
+
+```go
+type Server struct {
+    http *http.Server
+}
+```
+
+Wraps `http.Server` to expose `/metrics`.
+
+#### Constructor
+
+```go
+func NewServer(addr string, rec *PrometheusRecorder) *Server
+```
+
+Creates an `http.ServeMux` with a single `/metrics` route backed by the recorder's handler. Binds to `addr` (e.g. `":9090"`, `"127.0.0.1:0"`).
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `Handler() http.Handler` | Returns the server's root handler (for `httptest`) |
+| `ListenAndServe() error` | Blocks until shutdown; returns `http.ErrServerClosed` on graceful stop |
+| `Shutdown() error` | Graceful shutdown with a 5-second drain timeout via `context.WithTimeout` |
+
+---
+
+### Label Cardinality
+
+All labels have bounded, enum-like values:
+
+| Label | Possible Values | Source |
+|-------|----------------|--------|
+| `kind` | `rate_spike`, `error_surge`, `latency_spike`, `host_flood`, `silence` | `analyzer.AnomalyKind` constants |
+| `alerter` | `console`, `webhook`, `file` | `alerter.Name()` return values |
+| `channel` | `raw`, `parsed`, `counts`, `anomalies` | Pipeline channel names |
+
+No risk of label explosion — all values are compile-time constants.
+
+---
+
+### Integration Pattern
+
+```
+main.go:
+  if metricsAddr != "" {
+      rec := metrics.NewPrometheusRecorder()
+      srv := metrics.NewServer(metricsAddr, rec)
+      go srv.ListenAndServe()
+      defer srv.Shutdown()
+  } else {
+      rec = metrics.NoopRecorder{}
+  }
+  pipeline.New(cfg, alerter, rec).Run(ctx)
+```
+
+Pipeline calls `rec.IncLinesRead()` etc. inside `Run`. The `Recorder` interface means pipeline code has no `if metricsEnabled` conditionals — the noop path is handled by the type system.
