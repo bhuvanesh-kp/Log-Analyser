@@ -1,6 +1,7 @@
 package parser_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -93,6 +94,34 @@ func TestSyslogParser_Parse_ValidLine(t *testing.T) {
 			event, ok := p.Parse(rawLine(tc.line))
 			require.True(t, ok, "expected line to be parseable")
 			tc.check(t, event)
+		})
+	}
+}
+
+func TestSyslogParser_Parse_SeverityMapping(t *testing.T) {
+	// PRI = facility*8 + severity. Use facility=16 (local0, offset 128)
+	// so PRI = 128 + severity.
+	tests := []struct {
+		desc     string
+		pri      int
+		expected string
+	}{
+		{"severity 0 (emergency) maps to fatal", 128, "fatal"},
+		{"severity 1 (alert) maps to fatal", 129, "fatal"},
+		{"severity 2 (critical) maps to fatal", 130, "fatal"},
+		{"severity 3 (error) maps to error", 131, "error"},
+		{"severity 4 (warning) maps to warn", 132, "warn"},
+		{"severity 5 (notice) maps to info", 133, "info"},
+		{"severity 6 (informational) maps to info", 134, "info"},
+		{"severity 7 (debug) maps to debug", 135, "debug"},
+	}
+	p := syslogParser(t)
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			line := fmt.Sprintf("<%d>1 2026-04-01T12:00:00Z host app - - - msg", tc.pri)
+			event, ok := p.Parse(rawLine(line))
+			require.True(t, ok)
+			assert.Equal(t, tc.expected, event.Level)
 		})
 	}
 }

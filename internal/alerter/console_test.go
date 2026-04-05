@@ -3,6 +3,7 @@ package alerter_test
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -79,6 +80,34 @@ func TestConsoleAlerter_Send_ResetsANSIAfterLine(t *testing.T) {
 	a := alerter.NewConsoleAlerter(&buf, true)
 	require.NoError(t, a.Send(context.Background(), testAnomaly(analyzer.KindRateSpike, analyzer.SeverityWarning)))
 	assert.Contains(t, buf.String(), "\033[0m", "ANSI reset code should appear after each line")
+}
+
+func TestNewConsoleAlerterAuto_DisablesColorWhenNOCOLORSet(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var buf bytes.Buffer
+	a := alerter.NewConsoleAlerterAuto(&buf)
+	require.NoError(t, a.Send(context.Background(), testAnomaly(analyzer.KindRateSpike, analyzer.SeverityWarning)))
+	assert.NotContains(t, buf.String(), "\033[", "NO_COLOR should disable ANSI output")
+}
+
+func TestNewConsoleAlerterAuto_DisablesColorForNonTTYWriter(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	var buf bytes.Buffer // bytes.Buffer is not an *os.File, so not a TTY
+	a := alerter.NewConsoleAlerterAuto(&buf)
+	require.NoError(t, a.Send(context.Background(), testAnomaly(analyzer.KindRateSpike, analyzer.SeverityWarning)))
+	assert.NotContains(t, buf.String(), "\033[", "non-TTY writer should disable ANSI output")
+}
+
+func TestNewConsoleAlerterAuto_DisablesColorForRegularFile(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	f, err := os.CreateTemp(t.TempDir(), "console-*.log")
+	require.NoError(t, err)
+	defer f.Close()
+	a := alerter.NewConsoleAlerterAuto(f)
+	require.NoError(t, a.Send(context.Background(), testAnomaly(analyzer.KindRateSpike, analyzer.SeverityWarning)))
+	data, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "\033[", "regular file (not char device) should disable ANSI output")
 }
 
 func TestConsoleAlerter_Send_IncludesTimestamp(t *testing.T) {

@@ -555,3 +555,42 @@ func TestRun_FlushesOnShutdown(t *testing.T) {
 			"should flush the 3 in-flight events in the final partial bucket")
 	})
 }
+
+// TestRun_ContinuesAfterInputClosed verifies that Run keeps ticking (and
+// emitting zero buckets) after the input channel has been closed, until ctx
+// is cancelled. This exercises the `in = nil` branch that disables further
+// channel reads after EOF.
+func TestRun_ContinuesAfterInputClosed(t *testing.T) {
+	t.Run("should keep flushing buckets after in is closed until ctx cancelled", func(t *testing.T) {
+		in := make(chan parser.ParsedEvent, 4)
+		out := make(chan counter.EventCount, 16)
+		c := counter.New(30 * time.Millisecond)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.Run(ctx, in, out)
+		}()
+
+		in <- httpEvent(200, 0)
+		close(in) // close before any ticker fires; Run should set in = nil and keep ticking
+
+		// Give the ticker time to fire at least twice on nil-input
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		<-done
+		close(out)
+
+		buckets := collect(t, out, time.Second)
+		require.NotEmpty(t, buckets)
+
+		var total int64
+		for _, b := range buckets {
+			total += b.Total
+		}
+		assert.Equal(t, int64(1), total, "the single event should be counted exactly once")
+		assert.GreaterOrEqual(t, len(buckets), 2,
+			"should emit at least one ticker bucket after in closed plus the final shutdown bucket")
+	})
+}

@@ -99,6 +99,24 @@ func TestNewParser_NameMatchesFormat(t *testing.T) {
 	}
 }
 
+func TestNewPool_ClampsWorkersBelowOne(t *testing.T) {
+	// Run with workers=0 — should clamp to 1 and still process lines.
+	// If clamping failed the call would hang or drop all output.
+	t.Run("should default to 1 worker when workers < 1", func(t *testing.T) {
+		lines := []string{
+			`127.0.0.1 - - [01/Apr/2026:00:00:01 +0000] "GET /api HTTP/1.1" 200 512 "-" "curl/7.0" 0.042`,
+		}
+		events := runPool(t, "nginx", lines, 0)
+		assert.Len(t, events, 1, "pool with workers=0 should still emit events (clamped to 1)")
+	})
+	t.Run("should default to 1 worker when workers is negative", func(t *testing.T) {
+		events := runPool(t, "nginx", []string{
+			`127.0.0.1 - - [01/Apr/2026:00:00:01 +0000] "GET /api HTTP/1.1" 200 512 "-" "curl/7.0" 0.042`,
+		}, -5)
+		assert.Len(t, events, 1, "pool with negative workers should still emit events (clamped to 1)")
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Pool — Run
 // ---------------------------------------------------------------------------

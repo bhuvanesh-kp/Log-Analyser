@@ -170,6 +170,19 @@ func TestWebhookAlerter_Send_NoRetryOn4xx(t *testing.T) {
 	assert.Equal(t, 1, attempts, "should not retry on 4xx")
 }
 
+func TestWebhookAlerter_Send_ErrorMessageContainsStatusCode(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	a, err := alerter.NewWebhookAlerter(srv.URL, "", srv.Client(), 1,
+		alerter.WithRetryDelays([]time.Duration{0}))
+	require.NoError(t, err)
+	err = a.Send(context.Background(), testAnomaly(analyzer.KindRateSpike, analyzer.SeverityWarning))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "418", "error should include the HTTP status code")
+	assert.Contains(t, err.Error(), "webhook", "error should identify webhook")
+}
+
 func TestWebhookAlerter_Send_ReturnsErrorAfterMaxRetries(t *testing.T) {
 	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

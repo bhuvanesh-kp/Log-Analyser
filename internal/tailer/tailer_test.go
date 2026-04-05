@@ -385,3 +385,48 @@ func TestRun_LargeLines(t *testing.T) {
 		assert.Equal(t, len(bigLine), len(lines[0].Content))
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Error paths
+// ---------------------------------------------------------------------------
+
+func TestRun_NonexistentFile_ReturnsImmediately(t *testing.T) {
+	t.Run("should return without emitting when the file does not exist", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "does_not_exist.log")
+		out, cancel := runTailer(t, path, false, 10*time.Millisecond)
+		defer cancel()
+
+		// Tailer should exit quickly and close the output channel; collect will
+		// return an empty slice once the close propagates.
+		lines := collect(t, out, 500*time.Millisecond)
+		assert.Empty(t, lines, "no lines should be emitted for a missing file")
+	})
+}
+
+func TestRun_Stdin_ReadsLinesFromOSPipe(t *testing.T) {
+	t.Run("should read lines from stdin when path is empty", func(t *testing.T) {
+		// Replace os.Stdin with the read end of a pipe so runStdin can consume it.
+		r, w, err := os.Pipe()
+		require.NoError(t, err)
+		origStdin := os.Stdin
+		os.Stdin = r
+		t.Cleanup(func() {
+			os.Stdin = origStdin
+			r.Close()
+		})
+
+		go func() {
+			defer w.Close()
+			_, _ = w.WriteString("alpha\nbeta\ngamma\n")
+		}()
+
+		out, cancel := runTailer(t, "", false, 10*time.Millisecond)
+		defer cancel()
+
+		lines := collect(t, out, 500*time.Millisecond)
+		require.Len(t, lines, 3)
+		assert.Equal(t, "alpha", lines[0].Content)
+		assert.Equal(t, "stdin", lines[0].Source)
+		assert.Equal(t, int64(3), lines[2].LineNum)
+	})
+}

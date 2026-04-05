@@ -269,6 +269,63 @@ func TestRun_RespectsConfigFile(t *testing.T) {
 	}
 }
 
+func TestApplyFlagOverrides_AppliesEveryFlag(t *testing.T) {
+	cmd := newRootCmd()
+	// Parse every flag that applyFlagOverrides reads, using values that differ
+	// from config defaults so we can verify they landed in the config.
+	require.NoError(t, cmd.Flags().Parse([]string{
+		"--file", "/tmp/x.log",
+		"--follow=false",
+		"--format", "apache",
+		"--window", "90s",
+		"--bucket", "2s",
+		"--spike-multiplier", "7.5",
+		"--error-rate", "0.25",
+		"--host-flood", "0.75",
+		"--latency-multiplier", "6.0",
+		"--silence", "120",
+		"--cooldown", "45s",
+		"--min-baseline", "20",
+		"--detection-method", "stddev",
+		"--workers", "8",
+		"--webhook", "http://example.com/hook",
+		"--alert-file", "/tmp/alerts.jsonl",
+		"--metrics-addr", ":9999",
+	}))
+
+	cfg := config.Default()
+	applyFlagOverrides(cmd, cfg)
+
+	assert.Equal(t, "/tmp/x.log", cfg.LogFile)
+	assert.False(t, cfg.Follow)
+	assert.Equal(t, "apache", cfg.Format)
+	assert.Equal(t, 90*time.Second, cfg.WindowSize)
+	assert.Equal(t, 2*time.Second, cfg.BucketDuration)
+	assert.InDelta(t, 7.5, cfg.SpikeMultiplier, 1e-9)
+	assert.InDelta(t, 0.25, cfg.ErrorRateThreshold, 1e-9)
+	assert.InDelta(t, 0.75, cfg.HostFloodFraction, 1e-9)
+	assert.InDelta(t, 6.0, cfg.LatencyMultiplier, 1e-9)
+	assert.Equal(t, 120, cfg.SilenceThreshold)
+	assert.Equal(t, 45*time.Second, cfg.AlertCooldown)
+	assert.Equal(t, 20, cfg.MinBaselineSamples)
+	assert.Equal(t, "stddev", cfg.DetectionMethod)
+	assert.Equal(t, 8, cfg.ParserWorkers)
+	assert.Equal(t, "http://example.com/hook", cfg.Alerters.Webhook.URL)
+	assert.Equal(t, "/tmp/alerts.jsonl", cfg.Alerters.File.Path)
+	assert.Equal(t, ":9999", cfg.MetricsAddr)
+}
+
+func TestApplyFlagOverrides_LeavesUnchangedFlagsAlone(t *testing.T) {
+	// When no flags are set, applyFlagOverrides must leave the config intact.
+	cmd := newRootCmd()
+	require.NoError(t, cmd.Flags().Parse([]string{}))
+
+	cfg := config.Default()
+	before := *cfg
+	applyFlagOverrides(cmd, cfg)
+	assert.Equal(t, before, *cfg, "no-flag invocation should not mutate config")
+}
+
 func TestRun_FlagOverridesConfigFile(t *testing.T) {
 	// Config file says follow=true, but flag says follow=false.
 	// With a static file and follow=false, command should exit cleanly.

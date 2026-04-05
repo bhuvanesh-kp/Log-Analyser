@@ -320,6 +320,26 @@ func TestLoad_Precedence(t *testing.T) {
 // Security: secret in config file must be rejected
 // ---------------------------------------------------------------------------
 
+func TestSecretInFileError_Error(t *testing.T) {
+	err := &config.SecretInFileError{Field: "alerters.webhook.secret"}
+	msg := err.Error()
+	assert.Contains(t, msg, "alerters.webhook.secret", "error message should include field name")
+	assert.Contains(t, msg, "LOG_ANALYSER_ALERTERS_WEBHOOK_SECRET", "error message should suggest env var")
+}
+
+func TestLoad_RejectsSecretInFile(t *testing.T) {
+	// Load() (merged file+env) should also reject secrets in file.
+	yaml := "alerters:\n  webhook:\n    enabled: true\n    url: \"http://example.com\"\n    secret: \"bad\""
+	_, err := config.Load(stubConfigFile(t, yaml))
+	require.Error(t, err)
+	assert.True(t, config.IsSecretInFileError(err), "Load should return SecretInFileError")
+}
+
+func TestLoad_ReturnsErrorOnMissingFile(t *testing.T) {
+	_, err := config.Load(filepath.Join(t.TempDir(), "does_not_exist.yaml"))
+	assert.Error(t, err)
+}
+
 func TestLoadFile_Security(t *testing.T) {
 	tests := []struct {
 		desc          string
